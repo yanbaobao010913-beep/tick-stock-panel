@@ -290,6 +290,15 @@ class MyConfig:
 - 分页必须有页数上限(防 count 异常导致死循环)和空页终止条件。
 - 拉取由 fetch 锁串行化, 慢不会并发重叠; 实际刷新周期 = 轮询间隔 + 拉取耗时,
   串行分页的全量快照本身就需要数秒, 不要按"6s 内必须完成"设计。
+- **上游按 IP 段封禁时要熔断并显式收窄覆盖范围, 不能每轮空打**。实测 2026-09-30:
+  新浪 `hq.sinajs.cn` 对阿里云 ECS IP 段恒 403(带 Referer、走 http/https、换 `hq2.sinajs.cn`
+  与 `rn=` 路径全部 403, 同请求家宽正常), 东财 `82.push2.eastmoney.com/api/qt/clist/get`
+  在连续几发全市场分页请求后直接断连。cnfree 的做法: client 把 403/429/501 归为
+  `CnFreeRateLimitedError`, provider 捕获后进入 `_SINA_BLOCK_S` 秒熔断(期内不再请求),
+  并降级到腾讯 `qt.gtimg.cn` 快照——腾讯单请求实测只安全到 60 只, 全市场 5000+ 只
+  ≈ 93 请求/轮(46s)且会招 WAF, 因此**降级期覆盖范围收窄为自选池**(∩本地维表,
+  上限 `_REALTIME_MAX_SYMBOLS` 只); 自选为空时返回 `[]` 并告警, 不静默给全市场假数据。
+  生效源记在 `provider.realtime_source`, `test_dataset("realtime")` 一并回显, 便于设置页排查。
 
 ## 测试要求
 
@@ -316,6 +325,13 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页 + 页间隔限频 + 单标的日K + dump 预签名下载, S3 下载不带 Key 头)
   - `provider.py` — Provider 实现(实测/文档双字段名映射、百分数→小数制、volume 股→手、上海零点戳 +8h 时区、dump 按 release 版本缓存、软失败、Key 探测)
   - `tests/test_fuyao_provider.py` — 73 个契约测试, 是新插件的测试范本
+- **`backend/app/plugins/cnfree/`** — 免费公开端点插件(runtime: none, 无 Key)
+  - 提供 `realtime`(股票+ETF 快照: 新浪全市场优先, 被封禁时熔断降级腾讯自选池模式,
+    见"限频与性能")、`daily`(腾讯不复权原始价)、`adj_factor`(腾讯 qfq/raw 推导单事件比值,
+    宁可漏不错)、`minute`(腾讯 m1, 浅历史 5 交易日)、`depth5`(腾讯五档, 量原生为手);
+    财务未声明 → `provider_has_dataset` False → 自动回退 TickFlow
+  - `tests/test_cnfree_provider.py` — GBK 报文样例 + 假 httpx/假 Client, 含新浪封禁
+    降级、熔断期内不重试、覆盖范围收窄与上限截断、到期自动恢复新浪
 - **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
   - `bridge.py` — Python↔Node 桥接 + availability 检测
   - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)

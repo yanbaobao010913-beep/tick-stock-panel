@@ -144,7 +144,7 @@ class _FakeSinaHttp:
         self.error = error
         self.calls: list[str] = []
 
-    def get(self, url, params=None):
+    def get(self, url, params=None, **kw):
         self.calls.append(url)
         if self.error:
             raise self.error
@@ -184,10 +184,23 @@ class _FakeClient:
     """provider 层假客户端: 预置快照/日K/分钟数据, 记录调用供断言。
 
     error: sina_snapshot 抛出(整体软失败); daily_error_codes: 指定代码的日K
-    请求抛出(单标的软失败)。
+    请求抛出(单标的软失败); tencent_rows_error: 降级源整体失败;
+    tencent_blocked: 降级源也被 WAF 限流(抛 CnFreeRateLimitedError)。
     """
 
-    def __init__(self, snapshot=None, daily=None, minute=None, error=None, daily_error_codes=(), depth=None, depth_error=False):
+    def __init__(
+        self,
+        snapshot=None,
+        daily=None,
+        minute=None,
+        error=None,
+        daily_error_codes=(),
+        depth=None,
+        depth_error=False,
+        tencent_rows=None,
+        tencent_snapshot_error=None,
+        tencent_blocked=False,
+    ):
         self.snapshot = snapshot or {}
         self.daily = daily or {}
         self.minute = minute or {}
@@ -195,8 +208,12 @@ class _FakeClient:
         self.daily_error_codes = set(daily_error_codes)
         self.depth = depth or {}
         self.depth_error = depth_error
+        self.tencent_rows = tencent_rows or {}
+        self.tencent_rows_error = tencent_snapshot_error
+        self.tencent_blocked = tencent_blocked
         self.depth_calls: list[list[str]] = []
         self.sina_calls: list[list[str]] = []
+        self.tencent_calls: list[list[str]] = []
         self.daily_calls: list[tuple] = []
         self.minute_calls: list[tuple] = []
 
@@ -209,6 +226,15 @@ class _FakeClient:
             if code in self.depth:
                 out[code] = self.depth[code]
         return out
+
+    def tencent_snapshot(self, codes):
+        self.tencent_calls.append(list(codes))
+        if self.tencent_blocked:
+            raise cc.CnFreeRateLimitedError("腾讯快照疑似被 WAF 限流 HTTP 501")
+        if self.tencent_rows_error:
+            raise self.tencent_rows_error
+        wanted = set(codes)
+        return {c: f for c, f in self.tencent_rows.items() if c in wanted}
 
     def sina_snapshot(self, codes):
         self.sina_calls.append(list(codes))
@@ -1283,3 +1309,263 @@ def test_close_is_idempotent(monkeypatch):
     p.close()
     p.close()  # 二次调用不抛异常
     assert p._client is None
+# =====================================================================
+# 腾讯快照降级源: 样例数据 / client 层 / 映射口径
+# =====================================================================
+
+
+def _tencent_fields(**over) -> list[str]:
+    """88 字段腾讯快照行(实测 2026-09-30 sh600519 收盘态, 与 tushare daily 交叉核对)。
+
+    [1]名称 [3]最新 [4]昨收 [5]今开 [6]成交量(手) [9..28]五档价量 [30]时间
+    [31]涨跌额 [32]涨跌%(2 位小数) [33]高 [34]低 [35]"价/量/成交额(元)" [37]额(万元)。
+    """
+    fields = [""] * 88
+    fields[0] = "1"
+    fields[1] = "贵州茅台"
+    fields[2] = "600519"
+    fields[3] = "1258.62"
+    fields[4] = "1235.58"
+    fields[5] = "1239.53"
+    fields[6] = "38331"
+    fields[7] = "21633"
+    fields[8] = "16698"
+    for k in range(5):
+        fields[9 + k * 2] = f"{1258.0 + k:.2f}"
+        fields[10 + k * 2] = str(1 + k)
+        fields[19 + k * 2] = f"{1258.5 + k:.2f}"
+        fields[20 + k * 2] = str(2 + k)
+    fields[30] = "20260930161458"
+    fields[31] = "23.04"
+    fields[32] = "1.86"
+    fields[33] = "1268.00"
+    fields[34] = "1236.05"
+    fields[35] = "1258.62/38331/4797246636"
+    fields[36] = "38331"
+    fields[37] = "479725"
+    fields[38] = "0.31"
+    fields[39] = "19.32"
+    return _override_fields(fields, over)
+
+
+def _tencent_line(code: str, fields: list[str]) -> str:
+    return f'v_{code}="{"~".join(fields)}";'
+
+
+def _tencent_body(*lines: str) -> bytes:
+    return ("\n".join(lines) + "\n").encode("gbk")
+
+
+def test_client_sina_403_raises_rate_limited(monkeypatch):
+    """云服务器 IP 段被新浪 403 封禁: 必须抛限流类异常, 让 provider 熔断降级。"""
+    monkeypatch.setattr(
+        cc.httpx, "Client", lambda **kw: _FakeSinaHttp(b"Forbidden", status_code=403)
+    )
+    with pytest.raises(cc.CnFreeRateLimitedError):
+        cc.CnFreeClient().sina_snapshot(["sh600519"])
+
+
+def test_client_sina_500_stays_plain_error(monkeypatch):
+    """非封禁类 HTTP 错误仍是 CnFreeError(软失败语义, 不该触发整段熔断)。"""
+    monkeypatch.setattr(cc.httpx, "Client", lambda **kw: _FakeSinaHttp(b"", status_code=500))
+    with pytest.raises(CnFreeError) as ei:
+        cc.CnFreeClient().sina_snapshot(["sh600519"])
+    assert not isinstance(ei.value, cc.CnFreeRateLimitedError)
+
+
+def test_client_tencent_snapshot_decodes_gbk_and_drops_short_rows(monkeypatch):
+    body = _tencent_body(
+        _tencent_line("sh600519", _tencent_fields()),
+        'v_sz000001="1~平安银行~000001";',  # 停牌/无效短行 → 必须丢弃
+    )
+    monkeypatch.setattr(cc.httpx, "Client", lambda **kw: _FakeSinaHttp(body))
+    out = cc.CnFreeClient().tencent_snapshot(["sh600519", "sz000001"])
+    assert set(out) == {"sh600519"}
+    assert out["sh600519"][3] == "1258.62"
+
+
+def test_client_tencent_snapshot_batches_by_60(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(cc, "_SNAPSHOT_BATCH", 2)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(cc.httpx, "Client", lambda **kw: _FakeSinaHttp(b""))
+    cc.CnFreeClient().tencent_snapshot(["sh1", "sh2", "sh3", "sh4", "sh5"])
+    assert len(sleeps) == 2  # 5 只 / 每批 2 → 3 批, 批间 sleep 2 次
+
+
+def test_client_tencent_snapshot_waf_raises_rate_limited(monkeypatch):
+    monkeypatch.setattr(
+        cc.httpx,
+        "Client",
+        lambda **kw: _FakeSinaHttp(b"<html>challenge</html>", status_code=501),
+    )
+    with pytest.raises(cc.CnFreeRateLimitedError):
+        cc.CnFreeClient().tencent_snapshot(["sh600519"])
+
+
+def test_tencent_mapping_units_and_precision():
+    """量纲: volume 原生手不再 /100; amount 取 [35] 尾段(元); change_pct 现算小数制。"""
+    rec = cp._map_tencent_fields("sh600519", "600519.SH", _tencent_fields())
+    assert rec["symbol"] == "600519.SH" and rec["name"] == "贵州茅台"
+    assert rec["last_price"] == 1258.62 and rec["prev_close"] == 1235.58
+    assert rec["open"] == 1239.53 and rec["high"] == 1268.00 and rec["low"] == 1236.05
+    assert rec["volume"] == 38331.0  # 手, 与 tushare daily vol=38330.98 手同源
+    assert rec["amount"] == 4797246636.0  # 元, = tushare amount 4797246.636 千元
+    # 腾讯 [32] 只有 1.86(2 位), 现算更准 → 断言用的是 最新/昨收
+    assert rec["change_pct"] == pytest.approx((1258.62 - 1235.58) / 1235.58)
+    assert rec["change_amount"] == pytest.approx(23.04)
+    assert rec["timestamp"] == _expect_beijing_ms(2026, 9, 30, 16, 14, 58)
+    assert rec["amplitude"] is None and rec["turnover_rate"] is None
+
+
+def test_tencent_mapping_rejects_short_row():
+    assert cp._map_tencent_fields("sh600519", "600519.SH", ["1", "x"] * 17) is None
+    bad = _tencent_fields(by_index={3: ""})  # 最新价缺失 → 不伪造
+    assert cp._map_tencent_fields("sh600519", "600519.SH", bad) is None
+
+
+# =====================================================================
+# 新浪封禁 → 腾讯自选池降级(provider 层熔断与覆盖范围)
+# =====================================================================
+
+
+def _fallback_provider(monkeypatch, universe, watch, tencent_rows=None, sina_error=None):
+    """构造"新浪被封"场景的 provider: sina 抛限流, 腾讯可返回预置行。"""
+    fake = _FakeClient(
+        snapshot={},
+        error=sina_error
+        or cc.CnFreeRateLimitedError("新浪快照疑似被封禁或限流 HTTP 403"),
+        tencent_rows={"sh600519": _tencent_fields()} if tencent_rows is None else tencent_rows,
+    )
+    p = _provider_with(monkeypatch, fake, universe={"stock": universe, "etf": []})
+    monkeypatch.setattr(p, "_load_watchlist", lambda: watch)
+    return p, fake
+
+
+def test_realtime_sina_blocked_falls_back_to_tencent(monkeypatch):
+    p, fake = _fallback_provider(monkeypatch, ["600519.SH"], ["600519.SH"])
+    records = p.get_realtime()
+    assert [r["symbol"] for r in records] == ["600519.SH"]
+    assert p.realtime_source == "tencent"
+    assert len(fake.sina_calls) == 1 and len(fake.tencent_calls) == 1
+
+
+def test_realtime_stays_blocked_within_cooldown(monkeypatch):
+    """熔断期内不再打新浪 — 省掉每轮一次必然 403 的请求。"""
+    p, fake = _fallback_provider(monkeypatch, ["600519.SH"], ["600519.SH"])
+    p.get_realtime()
+    fake.sina_calls.clear()
+    records = p.get_realtime()
+    assert records and fake.sina_calls == []
+    assert len(fake.tencent_calls) == 2
+
+
+def test_realtime_scopes_to_watchlist_not_full_market(monkeypatch):
+    """降级覆盖范围: 只拉自选 ∩ universe(腾讯 60 只/请求撑不起全市场轮询)。"""
+    p, fake = _fallback_provider(
+        monkeypatch,
+        ["600519.SH", "000001.SZ", "300750.SZ"],
+        ["600519.SH"],
+        tencent_rows={
+            "sh600519": _tencent_fields(),
+            "sz000001": _tencent_fields(by_index={1: "平安银行", 2: "000001"}),
+        },
+    )
+    records = p.get_realtime()
+    assert fake.tencent_calls[0] == ["sh600519"]
+    assert [r["symbol"] for r in records] == ["600519.SH"]
+
+
+def test_realtime_fallback_with_empty_watchlist_returns_empty(monkeypatch, caplog):
+    """自选为空 → 明确不返回数据(不静默给全市场假快照), 且给出可读告警。"""
+    p, fake = _fallback_provider(monkeypatch, ["600519.SH"], [])
+    with caplog.at_level("WARNING"):
+        assert p.get_realtime() == []
+    assert fake.tencent_calls == []
+    assert "自选为空" in caplog.text
+
+
+def test_realtime_fallback_caps_symbols_per_round(monkeypatch):
+    monkeypatch.setattr(cp, "_REALTIME_MAX_SYMBOLS", 2)
+    p, fake = _fallback_provider(
+        monkeypatch,
+        ["600519.SH", "000001.SZ", "300750.SZ"],
+        ["600519.SH", "000001.SZ", "300750.SZ"],
+        tencent_rows={},
+    )
+    p.get_realtime()
+    assert len(fake.tencent_calls[0]) == 2
+
+
+def test_realtime_both_sources_blocked_soft_returns_empty(monkeypatch):
+    """腾讯也被 WAF 掐 → 软返回 [], 不抛异常打断 quote_service 轮询线程。"""
+    p, _ = _fallback_provider(monkeypatch, ["600519.SH"], ["600519.SH"])
+    p._sina_blocked_until = time.time() + 100
+    p._get_client().tencent_blocked = True
+    assert p.get_realtime() == []
+
+
+def test_realtime_recovers_sina_after_cooldown(monkeypatch):
+    """熔断到期后自动回新浪(全市场), 不需要重启进程。"""
+    p, fake = _fallback_provider(monkeypatch, ["600519.SH"], ["600519.SH"])
+    p._sina_blocked_until = time.time() - 1  # 已过期
+    fake.error = None
+    fake.snapshot = {"sh600519": _sina_stock_fields()}
+    records = p.get_realtime()
+    assert p.realtime_source == "sina"
+    assert [r["symbol"] for r in records] == ["600519.SH"]
+    assert fake.tencent_calls == []
+
+
+def test_indices_fall_back_to_tencent_when_blocked(monkeypatch):
+    p, fake = _fallback_provider(monkeypatch, [], [])
+    p._sina_blocked_until = time.time() + 100
+    p._get_client().tencent_rows = {
+        "sh000001": _tencent_fields(by_index={1: "上证指数", 3: "3842.19"})
+    }
+    recs = p.get_realtime_indices(["000001.SH"])
+    assert recs is not None and recs[0]["last_price"] == 3842.19
+    assert fake.sina_calls == [] and len(fake.tencent_calls) == 1
+
+
+def test_indices_tencent_failure_returns_none(monkeypatch):
+    """降级仍失败 → None(上层保留上轮指数缓存), 不能返回 [] 把缓存清空。"""
+    p, _ = _fallback_provider(monkeypatch, [], [])
+    p._sina_blocked_until = time.time() + 100
+    p._get_client().tencent_rows_error = CnFreeError("腾讯快照 HTTP 500")
+    assert p.get_realtime_indices(["000001.SH"]) is None
+
+
+def test_indices_sina_block_then_tencent_retry(monkeypatch):
+    """首轮新浪 403: 当场降级腾讯出数据, 不空转一轮。"""
+    p, fake = _fallback_provider(monkeypatch, [], [])
+    p._get_client().tencent_rows = {"sh000001": _tencent_fields(by_index={1: "上证指数"})}
+    recs = p.get_realtime_indices(["000001.SH"])
+    assert recs and recs[0]["symbol"] == "000001.SH"
+    assert p.realtime_source == "tencent"
+    assert len(fake.sina_calls) == 1 and len(fake.tencent_calls) == 1
+
+
+def test_watchlist_reader_missing_file_returns_empty(monkeypatch, tmp_path):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    assert CnFreeProvider()._load_watchlist() == []
+
+
+def test_watchlist_reader_symbols_sorted_unique(monkeypatch, tmp_path):
+    from app.config import settings
+
+    wd = tmp_path / "user_data"
+    wd.mkdir(parents=True)
+    pl.DataFrame({"symbol": ["300750.SZ", "600519.SH", "600519.SH"]}).write_parquet(
+        wd / "watchlist.parquet"
+    )
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    assert CnFreeProvider()._load_watchlist() == ["300750.SZ", "600519.SH"]
+
+
+def test_test_dataset_reports_active_realtime_source(monkeypatch):
+    p, _ = _fallback_provider(monkeypatch, ["600519.SH"], ["600519.SH"])
+    out = p.test_dataset("realtime", ["600519.SH"])
+    assert out["realtime_source"] == "tencent" and out["rows"] == 1

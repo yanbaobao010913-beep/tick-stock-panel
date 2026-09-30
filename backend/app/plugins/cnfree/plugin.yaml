@@ -1,6 +1,8 @@
 # 免费数据链 — 新浪/腾讯公开端点插件 (无 Key, runtime: none)。
-# realtime/指数/五档盘口走新浪 hq.sinajs.cn 与腾讯 qt.gtimg.cn (GBK, 需 Referer);
-# daily/adj_factor/minute 走腾讯 ifzq.gtimg.cn 公开 K 线端点。财务无免费源, 回退 TickFlow。
+# realtime 双源: 新浪 hq.sinajs.cn 全市场优先(800 只/批), 新浪对云服务器 IP 段
+# 恒 403 时熔断并降级腾讯 qt.gtimg 快照(60 只/批, 只覆盖自选池); 指数同规则降级;
+# 五档盘口恒走腾讯 qt.gtimg.cn; daily/adj_factor/minute 走腾讯 ifzq.gtimg.cn K 线端点。
+# 财务无免费源, 回退 TickFlow。均为 GBK 响应, 需 Referer。
 
 name: cnfree
 display_name: "免费数据链(新浪/腾讯)"
@@ -8,4 +10,4 @@ runtime: none
 entry: app.plugins.cnfree.provider:CnFreeProvider
 check: app.plugins.cnfree.provider:availability
 datasets: [realtime, daily, adj_factor, minute, depth5]
-description: "免费公开端点数据源, 无需 API Key。覆盖: A股股票+ETF 全市场实时快照(新浪, 含名称/量额); 指数实时补拉(同新浪端点); 日K不复权原始价(腾讯, 股票+ETF, 800 根/页分段); 除权因子(腾讯 qfq/raw 推导, 事件级稀疏输出); 分钟K(腾讯 m1, 单请求上限 320 根, 浅历史约 5 个交易日); 五档盘口(腾讯 qt.gtimg, 股票+ETF, 量单位手)。财务无免费源, 自动回退 TickFlow。"
+description: "免费公开端点数据源, 无需 API Key。覆盖: A股股票+ETF 实时快照(新浪全市场优先, 含名称/量额; 云服务器 IP 被封时自动熔断降级腾讯、只覆盖自选池, 上限 300 只); 指数实时补拉(与股票同端点, 同样降级); 日K不复权原始价(腾讯, 股票+ETF, 800 根/页分段); 除权因子(腾讯 qfq/raw 推导, 事件级稀疏输出); 分钟K(腾讯 m1, 单请求上限 320 根, 浅历史约 5 个交易日); 五档盘口(腾讯 qt.gtimg, 股票+ETF, 量单位手)。财务无免费源, 自动回退 TickFlow。"

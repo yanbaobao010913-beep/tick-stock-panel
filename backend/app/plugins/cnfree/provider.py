@@ -5,8 +5,12 @@
 provider_has_dataset 为 False 自动回退 TickFlow。
 
 实现数据集:
-  - realtime     A股股票+ETF 全市场快照(新浪 hq.sinajs.cn, 标的池来自本地
-                 instruments parquet, 800 只/批); 指数经 get_realtime_indices 同端点补拉
+  - realtime     A股股票+ETF 快照。正常走新浪 hq.sinajs.cn(标的池来自本地
+                 instruments parquet, 800 只/批, 全市场); 新浪对云服务器 IP 段
+                 恒 403(2026-09-30 阿里云 ECS 实测) → 熔断 _SINA_BLOCK_S 秒并降级
+                 腾讯 qt.gtimg 快照, 此时覆盖范围收窄为自选池(上限 _REALTIME_MAX_SYMBOLS
+                 只), 生效源记在 provider.realtime_source。指数经 get_realtime_indices
+                 补拉, 降级期同样切腾讯端点。
   - daily        日K不复权原始价(腾讯 fqkline, 股票+ETF 同端点, 800 根/页分段)
   - adj_factor   除权因子(腾讯 qfq/raw 推导, 事件级稀疏输出, 见下)
   - minute       分钟K(腾讯 mkline m1, 单请求上限 320 根, 浅历史, minute_history_days=5)
@@ -86,6 +90,14 @@ _DEPTH_BATCH_INTERVAL_S = 0.3
 _SINA_SUFFIX = {".SH": "sh", ".SZ": "sz", ".BJ": "bj"}
 _SINA_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _SINA_TIME_RE = re.compile(r"\d{2}:\d{2}:\d{2}")
+
+# 新浪被封禁后的熔断时长(秒)。实测 2026-09-30: 云服务器 IP 段 403 是持续性封禁,
+# 每轮都重试只会白打一次请求并拖慢整轮快照; 熔断期内直接走腾讯。
+_SINA_BLOCK_S = 900.0
+# 降级到腾讯快照时的单轮标的上限。腾讯 qt.gtimg 实测 60 只/请求安全(见 client),
+# 300 只 = 5 个请求 ≈ 1.5s 一轮; 全市场 5000+ 只按同粒度需 ~90 请求 ≈ 46s,
+# 且实测连续高频请求会被 WAF 掐(东财同场景已实测断连), 故降级期只覆盖自选池。
+_REALTIME_MAX_SYMBOLS = 300
 
 
 def _naive_beijing(dt: datetime | None) -> datetime | None:
@@ -244,6 +256,55 @@ def _map_sina_fields(sina_code: str, symbol: str, fields: list[str], is_index: b
     }
 
 
+def _map_tencent_fields(
+    tencent_code: str, symbol: str, fields: list[str], is_index: bool = False
+) -> dict | None:
+    """腾讯快照字段 → 内部 realtime record(新浪被封禁时的降级源)。
+
+    字段: [1]名称 [3]最新 [4]昨收 [5]今开 [6]成交量(手) [30]时间 yyyyMMddHHMMSS
+          [33]高 [34]低 [35]"价/量/成交额(元)"。
+    量纲为实测(见 client 顶部): 成交量原生"手"不再 /100, 成交额原生"元";
+    指数 [6] 与股票同一字段位, 按手透传(与新浪 sh 指数口径一致)。
+    change_pct 一律由 最新/昨收 现算(腾讯 [32] 只保留 2 位小数, 精度低于现算),
+    amplitude / turnover_rate 留 None — 换手率需历史股本口径(§3.4), 交 enriched 管道。
+    """
+    if len(fields) < 36:
+        return None
+    last = _to_float(fields[3])
+    if last is None:
+        return None
+    prev = _to_float(fields[4])
+    change_amount = last - prev if prev is not None else None
+    change_pct = (
+        change_amount / prev if change_amount is not None and prev not in (None, 0) else None
+    )
+    amount: float | None = None
+    parts = str(fields[35]).split("/")
+    if len(parts) >= 3:
+        amount = _to_float(parts[2])
+    timestamp = int(time.time() * 1000)
+    with contextlib.suppress(ValueError):
+        ts = datetime.strptime(fields[30], "%Y%m%d%H%M%S")
+        timestamp = int(ts.replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
+    return {
+        "symbol": symbol,
+        "name": fields[1] or None,
+        "last_price": last,
+        "prev_close": prev,
+        "open": _to_float(fields[5]),
+        "high": _to_float(fields[33]),
+        "low": _to_float(fields[34]),
+        "volume": _to_float(fields[6]),  # 手, 原生量纲
+        "amount": amount,  # 元
+        "change_pct": change_pct,
+        "change_amount": change_amount,
+        "amplitude": None,
+        "turnover_rate": None,
+        "timestamp": timestamp,
+        "session": None,
+    }
+
+
 def _daily_close(row: list) -> tuple[date | None, float | None]:
     """腾讯日K行 [日期, open, close, high, low, ...] → (date, close)。"""
     if not isinstance(row, list) or len(row) < 3:
@@ -298,7 +359,11 @@ def _segment_starts(days: list[date], annotated: set[date]) -> list[int]:
 
 
 class CnFreeProvider:
-    """免费数据链数据源。realtime = 股票+ETF 全市场快照(quote_service 全市场模式轮询)。"""
+    """免费数据链数据源。
+
+    realtime = 股票+ETF 快照: 新浪全市场优先, 新浪被封(IP 段 403)时熔断并降级
+    腾讯自选池模式; 其余数据集(daily/adj_factor/minute/depth5)恒走腾讯。
+    """
 
     name = "cnfree"
     builtin = True
@@ -310,6 +375,25 @@ class CnFreeProvider:
         self.config = _CnFreeConfig()
         self._client: CnFreeClient | None = None
         self._universe_cache: dict[str, tuple[float, list[str]]] = {}
+        # 新浪封禁熔断到期时间戳(秒)与当前实时生效源, 供日志/试拉展示。
+        self._sina_blocked_until = 0.0
+        self.realtime_source = "sina"
+
+    # ---- 新浪封禁熔断 ----
+    def _sina_blocked(self) -> bool:
+        return time.time() < self._sina_blocked_until
+
+    def _block_sina(self, reason: str) -> None:
+        """标记新浪不可用并在熔断期内不再请求, 避免每轮白打一次。"""
+        self._sina_blocked_until = time.time() + _SINA_BLOCK_S
+        self.realtime_source = "tencent"
+        logger.warning(
+            "cnfree 新浪实时源不可用(%s), 熔断 %.0fs 内改走腾讯快照; "
+            "降级期只覆盖自选池(上限 %d 只)",
+            reason,
+            _SINA_BLOCK_S,
+            _REALTIME_MAX_SYMBOLS,
+        )
 
     def close(self) -> None:  # loader.load_all 重建注册表时会对每个 provider 调 close
         if self._client is not None:
@@ -346,9 +430,58 @@ class CnFreeProvider:
         self._universe_cache[kind] = (mtime, symbols)
         return symbols
 
+    def _load_watchlist(self) -> list[str]:
+        """自选池 symbol 列表(data/user_data/watchlist.parquet, 按 mtime 缓存)。
+
+        与 _load_universe 同一读取方式: 只依赖已挂载的 data 目录, 不反向 import
+        services(自选读写会拉起 tickflow client, 插件不该依赖它)。
+        """
+        from app.config import settings
+
+        path = settings.data_dir / "user_data" / "watchlist.parquet"
+        if not path.exists():
+            return []
+        try:
+            mtime = path.stat().st_mtime
+            cached = self._universe_cache.get("watchlist")
+            if cached is not None and cached[0] == mtime:
+                return cached[1]
+            df = pl.read_parquet(path, columns=["symbol"])
+            symbols = sorted(set(df["symbol"].drop_nulls().cast(pl.String).to_list()))
+        except Exception as e:
+            logger.warning("cnfree 自选池读取失败 (%s): %s", path, e)
+            return []
+        self._universe_cache["watchlist"] = (mtime, symbols)
+        return symbols
+
+    def _realtime_symbols(self, universe: list[str]) -> list[str]:
+        """降级模式的标的池: 自选池 ∩ universe, 超出上限截断并告警。"""
+        watch = set(self._load_watchlist())
+        picked = [s for s in universe if s in watch]
+        if not picked:
+            logger.warning(
+                "cnfree 降级模式依赖自选池, 但自选为空或未与本地维表交集为空 — "
+                "本轮不返回快照(不静默给全市场假数据); 请配置自选或修复新浪访问"
+            )
+            return []
+        if len(picked) > _REALTIME_MAX_SYMBOLS:
+            logger.warning(
+                "cnfree 降级模式自选 %d 只, 超过单轮上限 %d, 只拉前 %d 只",
+                len(picked),
+                _REALTIME_MAX_SYMBOLS,
+                _REALTIME_MAX_SYMBOLS,
+            )
+            picked = picked[:_REALTIME_MAX_SYMBOLS]
+        return picked
+
     # ---- realtime ----
     def get_realtime(self) -> list[dict]:
-        """全市场实时快照(股票+ETF) → 内部 realtime records。失败软返回 [](不阻断轮询)。"""
+        """实时快照(股票+ETF): 新浪全市场优先, 新浪被封则熔断并降级腾讯自选池。
+
+        实测 2026-09-30: hq.sinajs.cn 对阿里云 ECS IP 段恒 403(带 Referer/备用域
+        均无效), 而腾讯快照单请求只安全到 60 只 → 降级期覆盖范围从"全市场"收窄为
+        "自选池"(见 _realtime_symbols)。失败软返回 [](不阻断轮询)。
+        """
         symbols = self._load_universe("stock") + self._load_universe("etf")
         if not symbols:
             logger.warning(
@@ -356,13 +489,22 @@ class CnFreeProvider:
                 "instruments_etf/instruments_etf.parquet, 请先运行数据管道同步标的维表"
             )
             return []
-        return self._fetch_sina_records(symbols)
+        if self._sina_blocked():
+            return self._fetch_tencent_records(self._realtime_symbols(symbols))
+        try:
+            records = self._fetch_sina_records(symbols)
+        except CnFreeRateLimitedError as e:
+            self._block_sina(str(e))
+            return self._fetch_tencent_records(self._realtime_symbols(symbols))
+        self.realtime_source = "sina"
+        return records
 
     def get_realtime_indices(self, symbols: list[str]) -> list[dict] | None:
         """指数实时快照(可选插件协议, quote_service 鸭子类型调用)。
 
-        与股票同一新浪端点同格式(买一卖一为 0, volume 同样按 /100 折手)。
-        失败返回 None(上层保留上轮有效指数缓存); 成功但无数据返回 []。
+        股票/指数在新浪与腾讯都是同一端点同格式(买一卖一为 0, 量按手), 因此
+        熔断期内同样降级腾讯。失败返回 None(上层保留上轮有效指数缓存);
+        成功但无数据返回 []。
         """
         codes: list[str] = []
         sym_by_code: dict[str, str] = {}
@@ -375,8 +517,23 @@ class CnFreeProvider:
             sym_by_code[code] = symbol
         if not codes:
             return []
+        blocked = self._sina_blocked()
         try:
-            snap = self._get_client().sina_snapshot(codes)
+            snap = (
+                self._get_client().tencent_snapshot(codes)
+                if blocked
+                else self._get_client().sina_snapshot(codes)
+            )
+        except CnFreeRateLimitedError as e:
+            if blocked:
+                logger.warning("cnfree 指数行情(腾讯降级)拉取失败: %s", e)
+                return None
+            self._block_sina(str(e))
+            try:
+                snap = self._get_client().tencent_snapshot(codes)
+            except CnFreeError as e2:
+                logger.warning("cnfree 指数行情降级仍失败: %s", e2)
+                return None
         except CnFreeError as e:
             logger.warning("cnfree 指数行情拉取失败: %s", e)
             return None
@@ -385,14 +542,58 @@ class CnFreeProvider:
             symbol = sym_by_code.get(code)
             if symbol is None:
                 continue
-            rec = _map_sina_fields(code, symbol, fields, is_index=True)
+            rec = (
+                _map_tencent_fields(code, symbol, fields, is_index=True)
+                if blocked
+                else _map_sina_fields(code, symbol, fields, is_index=True)
+            )
             if rec is not None:
                 records.append(rec)
-        logger.info("cnfree 指数行情拉取完成: %d 条(请求 %d 只)", len(records), len(codes))
+        logger.info(
+            "cnfree 指数行情拉取完成(%s): %d 条(请求 %d 只)",
+            "腾讯降级" if blocked else "新浪",
+            len(records),
+            len(codes),
+        )
+        return records
+
+    def _fetch_tencent_records(self, symbols: list[str]) -> list[dict]:
+        """腾讯快照降级拉取(代码格式与新浪一致, 复用 _sina_code)。软失败返回 []。"""
+        if not symbols:
+            return []
+        codes: list[str] = []
+        sym_by_code: dict[str, str] = {}
+        for symbol in symbols:
+            code = _sina_code(symbol)
+            if code is not None:
+                codes.append(code)
+                sym_by_code[code] = symbol
+        if not codes:
+            return []
+        try:
+            snap = self._get_client().tencent_snapshot(codes)
+        except CnFreeError as e:
+            logger.warning("cnfree 腾讯快照降级拉取失败: %s", e)
+            return []
+        records: list[dict] = []
+        for code, fields in snap.items():
+            symbol = sym_by_code.get(code)
+            if symbol is None:
+                continue
+            rec = _map_tencent_fields(code, symbol, fields)
+            if rec is not None:
+                records.append(rec)
+        if snap and not records:
+            logger.warning("cnfree 腾讯快照 %d 行全部无法解析, 疑似接口结构变化", len(snap))
+            return []
+        logger.info("cnfree 实时行情(腾讯降级)拉取完成: %d 条(请求 %d 只)", len(records), len(codes))
         return records
 
     def _fetch_sina_records(self, symbols: list[str]) -> list[dict]:
-        """按标的池拉新浪快照并映射; 整批失败 / 结构不可识别时软返回 []。"""
+        """按标的池拉新浪快照并映射; 整批失败 / 结构不可识别时软返回 []。
+
+        封禁/限流类失败(CnFreeRateLimitedError)向上抛, 由 get_realtime 熔断降级。
+        """
         codes: list[str] = []
         sym_by_code: dict[str, str] = {}
         skipped = 0
@@ -407,6 +608,8 @@ class CnFreeProvider:
             logger.warning("cnfree 有 %d 个标的后缀无法映射新浪代码, 已跳过", skipped)
         try:
             snap = self._get_client().sina_snapshot(codes)
+        except CnFreeRateLimitedError:
+            raise
         except CnFreeError as e:
             logger.warning("cnfree 实时行情拉取失败: %s", e)
             return []
@@ -901,11 +1104,20 @@ class CnFreeProvider:
         now = datetime.now()
         try:
             if dataset == "realtime":
-                records = self._fetch_sina_records(syms or ["600519.SH", "000001.SZ"])
+                targets = syms or ["600519.SH", "000001.SZ"]
+                if self._sina_blocked():
+                    records = self._fetch_tencent_records(targets)
+                else:
+                    try:
+                        records = self._fetch_sina_records(targets)
+                    except CnFreeRateLimitedError as e:
+                        self._block_sina(str(e))
+                        records = self._fetch_tencent_records(targets)
                 return {
                     "provider": self.name,
                     "dataset": dataset,
                     "rows": len(records),
+                    "realtime_source": self.realtime_source,
                     "columns": list(records[0].keys()) if records else [],
                     "preview": records[:5],
                 }
