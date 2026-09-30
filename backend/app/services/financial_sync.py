@@ -8,12 +8,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import polars as pl
 
+from app.polars_guard import collect_slot
 from app.services.fs_utils import atomic_write_parquet
 from app.tickflow.capabilities import Cap, CapabilitySet
 
@@ -36,7 +36,10 @@ def _get_symbols(data_dir: Path) -> list[str]:
     if not inst_path.exists():
         return []
     try:
-        df = pl.read_parquet(inst_path, columns=["symbol"])
+        # Polars 并发闸: 同步线程的 collect 与行情轮询等并发时共用共享执行池,
+        # 不经闸会触发上游 rayon 池死锁(2026-09-30 实测全进程冻结 29 分钟)。
+        with collect_slot("background"):
+            df = pl.read_parquet(inst_path, columns=["symbol"])
         return df["symbol"].to_list()
     except Exception as e:
         logger.warning("读取 instruments 失败: %s", e)
@@ -70,12 +73,12 @@ def _fetch_table(
 
     # 自定义数据源分流
     if is_custom:
-        from app.services import preferences
         from app.data_providers import custom as custom_sources
+        from app.services import preferences
         try:
             provider = custom_sources.get_provider(preferences.get_financial_provider())
             df = provider.get_financials(table, symbols, latest_only=latest_only)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("sync_%s custom provider failed: %s", table, e)
             return pl.DataFrame()
         if df.is_empty() or "symbol" not in df.columns:
@@ -171,10 +174,11 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     ]
     if not valid:
         return pl.DataFrame()
-    merged = (
-        pl.concat(valid, how="diagonal_relaxed")
-        .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
-    )
+    with collect_slot("background"):
+        merged = (
+            pl.concat(valid, how="diagonal_relaxed")
+            .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
+        )
     sort_keys = ["symbol", "period_end"] + (
         ["announce_date"] if "announce_date" in merged.columns else []
     )
@@ -295,7 +299,8 @@ def get_financial_df(data_dir: Path, table: str) -> pl.DataFrame:
     if not path.exists():
         return pl.DataFrame()
     try:
-        return pl.read_parquet(path)
+        with collect_slot("background"):
+            return pl.read_parquet(path)
     except Exception as e:
         logger.warning("读取 financials/%s 失败: %s", table, e)
         return pl.DataFrame()
@@ -345,14 +350,14 @@ class FinancialScheduler:
                     continue
                 parquet = data_dir / "financials" / table / "part.parquet"
                 if parquet.exists():
-                    mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=timezone.utc).isoformat()
+                    mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=UTC).isoformat()
                     restored[table] = mtime
                     preferences.set_financial_sync_time(table, mtime)
                     logger.info("FinancialScheduler backfilled last_sync for %s from parquet mtime", table)
             self._last_sync = restored
             if self._last_sync:
                 logger.info("FinancialScheduler restored last_sync: %s", list(self._last_sync.keys()))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("restore financial_sync_times failed: %s", e)
 
         if not auto_schedule:
@@ -370,12 +375,12 @@ class FinancialScheduler:
         持久化确保即使重启,前端 /status 仍返回真实的最后同步时间,
         不会错误地显示"尚未同步"。
         """
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         self._last_sync[table] = ts
         try:
             from app.services import preferences
             preferences.set_financial_sync_time(table, ts)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("persist financial_sync_time(%s) failed: %s", e)
 
     def update_capabilities(self, capset: CapabilitySet) -> None:
@@ -505,7 +510,7 @@ class FinancialScheduler:
         def _bg() -> None:
             try:
                 self._run_body(table)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.exception("background financial sync failed: %s", e)
             finally:
                 with self._lock:

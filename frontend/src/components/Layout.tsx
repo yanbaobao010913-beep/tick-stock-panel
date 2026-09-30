@@ -54,7 +54,7 @@ import {
   IconMonitor,
   IconRegime,
   IconAlert,
-  IconLots,
+  // IconLots — dsa-migration: 随持仓提醒菜单隐藏一并停用 (2026-09-29)
   IconPaper,
   IconSignals,
   IconReview,
@@ -103,7 +103,9 @@ const nav = [
   { to: '/monitor',          label: '监控中心', icon: IconMonitor },
   { to: '/regime',           label: '市场环境', icon: IconRegime },
   { to: '/abnormal',         label: '异动监控', icon: IconAlert },
-  { to: '/lots',             label: '持仓提醒', icon: IconLots },
+  // dsa-migration: 持仓提醒(Lots)菜单按用户拍板隐藏 (2026-09-29) — 其手动批次提醒与
+  // DSA 报告点位自动挂线体系重复; 路由 /lots 保留可直达, 上游冲突时重贴本注释+下行。
+  // { to: '/lots',             label: '持仓提醒', icon: IconLots },
   { to: '/paper',            label: '模拟盘',   icon: IconPaper },
   { to: '/signals',          label: '信号库',   icon: IconSignals },
   { to: '/review',           label: '复盘',     icon: IconReview },

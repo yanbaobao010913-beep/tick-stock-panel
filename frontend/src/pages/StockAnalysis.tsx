@@ -12,6 +12,7 @@ import { api } from '@/lib/api'
 import { useLastStock } from '@/lib/useLastStock'
 import { QK } from '@/lib/queryKeys'
 import { toast } from '@/components/Toast'
+import { DsaAnalysisSection } from '@/custom/dsa/components/DsaAnalysisSection'
 import {
   startAnalysis, findTodayReport, useHistoryReports,
   deleteReport, openHistoryReport, loadHistory,
@@ -141,6 +142,9 @@ export function StockAnalysis() {
           </div>
           <HistorySidebar />
         </div>
+
+        {/* DSA 决策报告区 (扩展注入, 见 frontend/src/custom/dsa/) */}
+        <DsaAnalysisSection symbol={symbol || undefined} />
       </div>
 
       {/* 二次确认:已有历史报告 */}

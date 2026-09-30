@@ -17,6 +17,11 @@
 撮合规则:
   - 即时单: 盘中由行情轮询钩子按最新快照价成交 (evaluate_intraday);
   - next_open / close 单: 盘后管道 settle_day 按当日 raw_open / raw_close 成交;
+  - conditional 条件触发单 (P5' B1): 挂 trigger_price, 盘中快照价满足 trigger_op
+    (<= / >=) 即成交 (成交价=现价); 盘后 settle_day 用当日 low/high 判定穿越,
+    成交价 = min(open, trigger) (<= 向) / max(open, trigger) (>= 向) —— 跳空按
+    开盘价 (DSA 口径); expire=day 当日未触发作废 (入场单语义), expire=gtc 挂到
+    成交/撤单 (保护单语义); 成交仍走 _fill_order 全部校验 (费用/滑点/T+1/涨跌停/资金)
   - T+1: 当日买入次一交易日方可卖 (lots 按 buy_date 记账, available = date < today);
   - 涨跌停: 触及涨停的买单 / 跌停的卖单默认拒单 (expired 留痕); 账户开启
     queue_limit_orders 后转「排队次日重试」(转 next_open, 计顺延, 超限过期);

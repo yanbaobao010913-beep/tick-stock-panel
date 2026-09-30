@@ -1,0 +1,11 @@
+# 免费数据链 — 新浪/腾讯公开端点插件 (无 Key, runtime: none)。
+# realtime/指数/五档盘口走新浪 hq.sinajs.cn 与腾讯 qt.gtimg.cn (GBK, 需 Referer);
+# daily/adj_factor/minute 走腾讯 ifzq.gtimg.cn 公开 K 线端点。财务无免费源, 回退 TickFlow。
+
+name: cnfree
+display_name: "免费数据链(新浪/腾讯)"
+runtime: none
+entry: app.plugins.cnfree.provider:CnFreeProvider
+check: app.plugins.cnfree.provider:availability
+datasets: [realtime, daily, adj_factor, minute, depth5]
+description: "免费公开端点数据源, 无需 API Key。覆盖: A股股票+ETF 全市场实时快照(新浪, 含名称/量额); 指数实时补拉(同新浪端点); 日K不复权原始价(腾讯, 股票+ETF, 800 根/页分段); 除权因子(腾讯 qfq/raw 推导, 事件级稀疏输出); 分钟K(腾讯 m1, 单请求上限 320 根, 浅历史约 5 个交易日); 五档盘口(腾讯 qt.gtimg, 股票+ETF, 量单位手)。财务无免费源, 自动回退 TickFlow。"
