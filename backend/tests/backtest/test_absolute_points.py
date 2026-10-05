@@ -170,6 +170,44 @@ def test_entry_not_touched_rejected():
     assert result.stats["execution"]["buy_entry_not_touched"] == 1
 
 
+# ── 点位未触及 x close_t 涨停拦截 组合 (合并自上游 close_t 修复) ──
+def test_entry_not_touched_wins_over_close_t_limit_up():
+    """同时命中: 点位未触及 + close_t 收盘封板 → 归因先执行的 buy_entry_not_touched。"""
+    rows = [
+        _bar(10.0, 10.2, 9.8, 10.0),
+        # 收盘封涨停(非一字, prev_close 10.0 → limit 11.0): low 10.0 > 介入价 9.5
+        {"o": 10.05, "h": 11.0, "l": 10.0, "c": 11.0},
+        _bar(11.0, 11.2, 10.9, 11.1),
+        _bar(11.0, 11.2, 10.9, 11.1),
+    ]
+    panel = _panel(rows)
+    # 仅封板日声明涨停 (close_t: 信号日即成交日)
+    panel = panel.with_columns(
+        pl.when(pl.col("date") == BASE + timedelta(days=1))
+        .then(pl.lit(True)).otherwise(pl.col("signal_limit_up"))
+        .alias("signal_limit_up")
+    )
+    result = _run(panel, 1, _config(matching="close_t", entry_price=9.5))
+    assert result.trades == []
+    exec_stats = result.stats["execution"]
+    assert exec_stats["buy_entry_not_touched"] == 1
+    assert exec_stats.get("buy_limit_up", 0) == 0
+
+
+def test_entry_touched_close_t_normal_fill():
+    """两者都通过: close_t + 介入价触及 + 非涨停 → 正常成交 @ min(open, entry_price)。"""
+    panel = _panel([
+        _bar(10.0, 10.2, 9.8, 10.0),
+        _bar(10.2, 10.4, 9.9, 10.3),   # low 9.9 ≤ 11.0 触及; 无涨停
+        _bar(10.1, 10.2, 9.9, 10.0),
+    ])
+    result = _run(panel, 0, _config(matching="close_t", entry_price=11.0))
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_date == BASE.isoformat()  # close_t: 信号日即成交日
+    assert trade.entry_price == pytest.approx(10.0)  # min(open 10.0, 11.0)
+
+
 def test_absolute_stop_exit_matrix_matcher():
     panel = _panel([
         _bar(10.0, 10.2, 9.8, 10.0),
