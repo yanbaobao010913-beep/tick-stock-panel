@@ -327,13 +327,73 @@ GET  /paper/outcomes       → { "items": [{ "report_id", "symbol", "created_at"
   - 复用 `_fill_order` 全部校验（费用/滑点/T+1/涨跌停/资金）不动
 - **核心 `app/api/paper.py`**：下单模型放行新字段。
 - **桥（扩展侧，新模块或并入 dsa_watch）**：分析任务完成后——空仓票最新报告有 `ideal_buy` → 建次日 `conditional` 买单（`trigger_op="<=", expire="day"`，金额 = 权益/槽位数）；模拟盘持仓票最新报告 `stop_loss` 变化 → 重建 GTC 止损卖单（先撤旧的）。**take_profit 是移动止盈启动价，B1 不出单**（TSP 模拟盘无回撤跟踪引擎，如实标注）；卖出类建议 → `next_open` 卖单。
+- **2026-10-02 补注（GLM 实现已定）**：桥为 `dsa_paper_bridge.py` 纯后台 60s 轮询对账（无手动端点，替代契约原写的 POST /paper-bridge/run，已接受）；订单 source 标 `dsa:{report_id}[:stop|:exit]` 幂等去重；报告缺 stop_loss 时既有止损单保留（对齐 §4.3-1 槽位级保留）。
 - 前端：Paper 页订单/成交列表能认出 conditional 单（核心 Paper.tsx 小改：类型徽章+触发价列）；其余不动。
 
-### 4.7-2 B2 回测绝对点位（B1 验收后做）
+### 4.7-2 B2 回测绝对点位（2026-10-02 细化定稿，GLM 后端 / Kimi 前端）
 
-- **核心 `app/backtest/engine.py`**：`_risk_exit` 三处同构实现（:961 / :1379 / :2017 附近）支持绝对止损/止盈价（position 级 `stop_price`/`target_price`），优先于百分比口径；**按"修共享函数"原则把三处同构代码抽成一处再改**。
-- 入场侧：利用现成 `entry_price_override` 矩阵注入 `ideal_buy`，portfolio 撮合 `_can_buy` 加 `low <= 介入价` 的触及判定，成交价 `min(open, 介入价)`。
-- 报告→回测的喂入方式届时细化（策略覆盖参数 vs 批量 episode 模式）。
+- **核心 `app/backtest/engine.py`**：
+  - `MatcherConfig` 加三个绝对价字段：`entry_price: float | None`、`stop_price: float | None`、`take_profit_price: float | None`（默认 None = 行为不变，存量测试不破）。
+  - **先把三处同构 `_risk_exit`（portfolio :961 / legacy :1379 / 独立候选 :2017 附近）抽成一个共享函数再改**（DSA 教训：修共享函数一次，不逐 caller 补丁）：绝对 `stop_price` 存在时止损线直接用它（取代 `entry_price×(1−pct)`），`take_profit_price` 同理；穿越判定与成交价口径（开盘已破按 open、否则按线价）原样复用。
+  - 入场：`entry_price` 存在时，入场信号日成交需满足当日 `low ≤ entry_price`（触及判定），成交价 `min(open, entry_price)`（开盘更低按开盘，与 DSA 一致）；未触及 → 该信号不建仓（不留挂单）。矩阵路径用现成 `entry_price_override` 钩子实现，`_can_buy` 加触及检查。
+- **核心 `app/api/backtest.py` / 策略 overrides 链路**：放行这三个键到 MatcherConfig。
+- **扩展侧端点**（挂在 `/api/ext/dsa`）：`POST /backtest-report { "report_id": "…" }` ——取该报告的 symbol/点位/日期，构造报告日的入场信号，调核心引擎（绝对点位 + 费用滑点按默认）跑 episode，返回 `{ "symbol", "entry": { "date", "price" }|null, "exit": { "date", "price", "reason" }|null, "return_pct"|null, "holding_bars", "note" }`；未触及建仓/数据不足走 `note` 说明不报错。
+- **前端（Kimi）**：报告详情弹窗加"点位回测"按钮 → 调该端点 → 结果卡（建仓/出场/收益/原因/持有根数）。回测页本身不动。
+
+### 4.7-2b 回测页"DSA 点位"策略（2026-10-02 晚用户拍板："利用回测的功能实现 DSA 的效果"——否掉独立 tab 方案）
+
+- **形态**：后端把"DSA 点位"注册成一个策略定义，自动出现在回测页策略列表（`/api/strategies`），用户选中 → 仓位模拟/全量模拟 → **结果页零改动**。前端零改动（列表自动带出）。
+- **后端（GLM）**：
+  1. **报告物化成信号**：回测运行时把区间内扩展报告转为引擎信号行——`operation_advice` 文本映射方向（DSA §4.6-1 口径：买入/加仓→入场候选；卖出/减仓/清仓→次日开盘离场信号；观望/持有→不动）；入场信号日=报告日次日，`entry_price_override` 矩阵注入该报告 `ideal_buy`（触及判定 `low ≤ ideal_buy`，成交 `min(open, ideal_buy)`，未触及不建仓）。
+  2. **逐仓位绝对风控线**：B2 的 `stop_price`/`take_profit_price` 从 MatcherConfig 配置级扩为**逐仓位级**（pos 级字段，入场时从该信号行的报告点位注入）——同一策略下各票的线各自不同，这才是 DSA 的效果。配置级字段保留（单票/报告回测继续用）。
+  3. **策略定义**：id 建议 `dsa_points`，名称"DSA 点位"，出现在"全部"分组；参数面板可空（用报告点位）或暴露 trail/费用覆盖（可选，v1 不做）。出场语义：绝对止损线 + 绝对止盈线 + 卖出类建议次日开盘（TSP 口径：固定线成交，非移动止盈——与 DSA 的 trailing 差异在 docstring/报告里如实标注，用户要看 trailing 效果用扩展版 dsa_paper）。
+  4. 实现位置：优先走扩展/自定义策略机制；若策略系统不支持注入信号矩阵，最小核心改动点在 `backtest/strategy.py` 的矩阵构建处特判 `dsa_points`。
+- **验收**：选"DSA 点位"跑近 3 个月仓位模拟 → 交易明细里的入场价=报告 ideal_buy（或更优开盘）、出场价/原因对得上报告止损止盈线；与扩展版 dsa_paper 同区间结果方向一致（口径差异=费用滑点+固定止盈线，已声明）。
+
+### 4.7-2b 补：实施注记（2026-10-03 GLM 落地记录）
+
+- **实现组装**（契约第 4 条"优先扩展机制，最小特判"的落位）：
+  - **内建策略文件** `app/strategy/builtin/dsa_points.py`（id `dsa_points`，名称"DSA 点位"，`asset_types=["stock","etf"]`，`params=[]`，`MAX_HOLD_DAYS=10`）——出现在 `/api/strategies`（source=builtin，前端列表自动带出零改动）。META 打 `dsa_signal_rows: True` 标记；`compute_signals` 返回合法空信号（选股器/实时路径安全空跑，回测被特判接管）。
+  - **扩展物化器** `app/custom/dsa_points.py`（新模块，EXTENSION_ID `dsa.points`，未动其他 dsa_* 模块）：`materialize_dsa_signal_rows(market, start, end)` 把区间内报告物化成 SignalMatrix。卖出类关键词复用 `dsa_paper_bridge._is_sell_advice`（同文矛盾取保守侧）；入场行放报告日次一交易日（严格大于报告日的第一根K），逐格注入 ideal_buy/stop_loss/take_profit（float32，NaN=无）；缺 ideal_buy 的买入建议不建仓；同（票，入场日）多报告取更晚创建；窗口外/市场外标的跳过；单报告脏数据跳过不拖垮整体。
+  - **核心特判**（`backtest/strategy.py` matrix_native 分支，契约许可的落点）：① matcher_config 对 dsa_signal_rows 策略钉死口径——`entry_fill="close_t"`（信号行已预放在成交日，entry_delay=0）、`exit_fill="open_t+1"`（离场行在报告日，delay 次日开盘）、`entry_touch=True`、配置级 `entry_price` 关闭（避免全矩阵 min(open, 配置价) 覆盖逐格 ideal_buy；stop_price/take_profit_price 配置级保留作报告缺点位时的回退线）；② 信号计算换成物化器（不走过滤/评分管线）；③ 入场时间掩码豁免（报告日期界已在物化器内完成，入场格允许落在区间末根后一根；离场行照常受掩码）。请求 matching 不影响口径。
+- **引擎/matrix 协议扩展**（为逐仓位线与逐格触及做的通用能力，分钟路径不受影响）：
+  - `SignalMatrix`/`MarketMatrix` 新增可选逐格数组 `entry_price`（SignalMatrix 侧新增；MarketMatrix 侧已有）/`stop_price`/`take_profit_price`，贯穿 `_finalize_signal_matrix`/`make_signal_matrix`/`slice_signal_matrix`/`apply_time_masks`/`build_market_matrix_from_signals`（显式 `entry_price_override` kwarg 仍优先——分钟路径不变）；validate 对价位数组要求 float32 只读、NaN=无、有限值须为正。**fail-closed 守卫**：逐格介入价 + `entry_delay_bars=1` 会错位，直接拒绝。
+  - `MatcherConfig.entry_touch: bool`：开启后逐格介入价带触及语义（`_can_buy` 按格内介入价判 `low <= 价`，`_resolve_entry_prices` 成交 `min(当日 open, 格内价)`）；关闭时逐格价 = 精确成交价（分钟口径原样）。
+  - **逐仓位绝对风控线**：两个 matrix 撮合器建仓时把格内 stop/take 注入 `pos["stop_price"]/["take_profit_price"]`，`_risk_exit_decision` 新增 `pos_stop_price/pos_take_profit_price` 参数，优先级 逐仓位 > 配置级绝对 > 百分比。panel legacy 撮合器无逐格机制，不接入（dsa_points 只走 matrix 路径）。
+- **环境过滤（regime_filter）不作用于 DSA 信号行**（入场掩码豁免的副作用，v1 如实声明）。
+- **测试**：`tests/backtest/test_dsa_points_strategy.py` 11 例（物化器 5 + loader 装载 1 + 策略级 e2e 5：仓位模拟双票逐仓位止损线各自生效/跳空按开盘/止盈线/未触及不建仓/卖出建议次日开盘 signal 离场/全量模拟 10 根持有窗）。存量锁定测试随第 27 个内建策略更新计数（test_matrix_strategy 26→27 ×2、test_screener_etf 25→26）。全仓 2834 过，唯一失败为存量 cnfree（此前会话已用 HEAD 复现验证）。改动文件 ruff 零新增（engine 净减 2；三个新文件零告警）。
+- **验收第一句**（选策略跑近 3 个月仓位模拟看交易明细）依赖实机数据联调；与 dsa_paper 的同号互证口径差异同 B2（费用滑点 + 固定止盈线），已声明。
+
+### 4.7-2 补：B2 实施注记（2026-10-02 GLM 落地记录）
+
+- **核心 engine.py**：三字段已加（`entry_price`/`stop_price`/`take_profit_price`，默认 None 行为不变，存量测试全过）。实现拍板补充：
+  - **同构抽取实际为四处**：计划列的三处（matrix 独立 :961 / legacy 独立 :1379 / portfolio matrix 内联 :2017）之外，`simulate_portfolio_legacy` 的 `_process_risk_exits` 是第四份逐字同构副本——按「修共享函数一次」的教训一并抽入模块级纯函数 `_risk_exit_decision`，四处 caller 只保留各自的前置守卫（pending/当日建仓跳过）。抽取后既有回测套件全过（含行为锁定用例），engine ruff 告警净减。
+  - **绝对线语义**：`stop_price` 存在时**取代**百分比止损线（两者同设百分比不生效），`take_profit_price` 同理；移动止损/回撤止盈线照常共存，多线取最高有效线（先到先触发）；穿越与成交价口径（开盘已破按 open、盘中触及按线价）原样复用。
+  - **入场触及**：四个撮合器的 `_can_buy` 统一加 `low <= entry_price` 触及检查（low 无效 fail-closed 按未触及），新拒单计数 `buy_entry_not_touched`；成交价 `min(当日 open, entry_price)`——matrix 路径在 `_resolve_entry_prices`（`entry_price_override` 钩子的消费函数）里全矩阵实现，panel legacy 路径在买入点用 `_absolute_entry_base` 调整基准。分钟策略逐格 override 路径不设 `entry_price`，互不干扰。
+- **overrides 链路**：`app/api/backtest.py` 的 `overrides` 本就是裸 dict 透传（缓存键已含 overrides JSON），无需改动；放行点在 `app/backtest/strategy.py`——新增 `_normalize_abs_price`（有限正数才有效，空/非法/非正 = 不启用，对齐 `_normalize_pct` 宽松先例），三键经主路径与分钟路径两处 MatcherConfig 构造传入（优化器/步进优化共享同一入口）。既有分钟 e2e 已在跑该调用链（接线错误会 TypeError）。
+- **扩展端点**：`backend/app/custom/dsa_backtest.py`（新模块，EXTENSION_ID `dsa.backtest`，未动其他 dsa_* 模块）。`POST /api/ext/dsa/backtest-report` 实现拍板补充：
+  - **口径**：信号日 = 报告 created_at 前 10 位；`matching="open_t+1"`（次一交易日成交，触及判定/成交价都在成交日）+ `exit_fill="close_t"`（无卖出信号，max_hold/end 按当日收盘 = DSA 窗口到期口径）；持有窗 `max_hold_days=10`（DSA §4.6-2）；费用滑点按引擎默认（fees 万2 双边 + 滑点 5bps；DSA dsa_paper 是零费用口径，刻意不同——互证只看同号）；一字板拒单不在口径内（原始 enriched 无 limit 信号列，如实缺席）；卖出类建议不出场（核心引擎无 sell_signal，如实缺席）。
+  - **结果语义**：建仓/出场等数据性结果 200 + note（未触及建仓 → note「未触及介入价」、数据不足 → note 不报错）；报告不存在 404、报告缺 ideal_buy 400（调用方错误）；`holding_bars` = 引擎原生 `duration`（成交日之后的持有根数，与 DSA 逐根计数一致）；`return_pct` 为百分数（含费用），与 dsa_paper trades 同单位可互证。
+  - 面板窗口：报告日 -15/+45 自然日；引擎走核心单例（镜像 `api/backtest._get_engine`，PanelCache 复用）。
+- **测试**：`tests/backtest/test_absolute_points.py`（16 例：共享决策纯函数口径 + matrix/portfolio/legacy 三撮合器的触及/跳空/绝对线/取代百分比/移动止损共存）+ `tests/test_dsa_backtest.py`（9 例：端点契约形状、全流程/跳空/止盈/未触及 note/数据不足/404/400/持有窗/loader 注册）。验证：回测 + dsa 套件全过；全仓 2822 过（仅存量 cnfree 失败与 worker spawn 偶发，均与本次无关）；改动文件 ruff 无新增告警（engine/strategy 有历史告警按 CONTRIBUTING 不顺手清理，新增文件零告警）。
+- **前端（Kimi）**：报告详情弹窗"点位回测"按钮由 Kimi 并行实施（工作区已有对应改动），后端契约如上；回测页本身不动。
+- **B2 验收**（同一报告与 dsa_paper episode 结果同号互证）：依赖实机数据联调确认；核心口径与 dsa_paper 的入场（次日触及 min(open, 介入价)）/止损/持有窗已对齐，费用与移动止盈为两处已知口径差异（见上）。
+
+### 4.7-1 补：B1 实施注记（2026-10-02 GLM 落地记录）
+
+- **核心**：`app/strategy/paper.py` + `app/api/paper.py` 已落 conditional 单（字段/撮合口径按本节契约），测试 `tests/test_paper_conditional.py`（盘中现价成交、跳空按开盘价、穿越按触发价、day 作废、gtc 持续、费用/T+1/涨跌停不被绕过、API 透传）。实现拍板补充：
+  - **day 语义 = 首个可评估交易日**：18:00 后创建的单次日结算评估（未触发即作废）；盘中（开盘后）创建的单当日结算跳过（`_placed_after_price_time` 对 conditional 取 09:30 门控，开盘后区间不可回填），次日评估。盘中即时触发不受创建时刻限制。
+  - **排队重试保持触发语义**：`queue_limit_orders` 开启时 conditional 单遇涨跌停拒单**不转 next_open**（否则保护性止损单会被静默改成次日无条件市价卖），保持原触发条件次日重判，计顺延超限过期。
+  - `read_daily_bar` 扩展返回全 OHLC（含 null 安全）；缺 low/high 视同缺行情顺延。
+- **桥**：`backend/app/custom/dsa_paper_bridge.py`（新扩展模块，未动其他 dsa_* 模块——dsa_analysis 的任务收尾钩子固定调 dsa_watch，桥自起 daemon 线程 60s 轮询报告库对账，不动钩子链）。实现拍板补充：
+  - **账户 = default**；槽位 = 10（对齐 §4.6-3 口径）；买单金额 = 权益/10 按触发价折整百，资金校验按账户现金（现金不足的槽位 skipped 留痕）。
+  - **幂等按订单 source**（`dsa:{report_id}` 入场 / `:stop` 止损 / `:exit` 建议卖）：同 source 订单任何状态下存在即不重建 → day 作废不重挂、报告未更新不重建；对账为纯 diff，pending 的 dsa 单不在保留集即撤。
+  - **卖出类建议 = 次日开盘全量可卖整百 next_open 卖单**，意图优先于止损线（本拍撤该票全部止损单）；空仓票的卖出类建议不建入场单。
+  - **保护性保留**：持仓票最新报告缺 `stop_loss` 或报告库已无该票报告时，既有 pending 止损单保留不撤（对齐 §4.3-1 槽位级保留语义）；空仓票残留卖出单一律撤。
+  - **已知边界**：止损单触发遇跌停拒单后默认（queue 关）过期不自动重挂——账户开启 `queue_limit_orders` 可保持触发条件次日重试；应用整体跨日宕机时 day 单可能晚一日成交（作废的权威路径是盘后结算，宕机日无结算）。
+  - 测试 `tests/test_dsa_paper_bridge.py`（入场生成/幂等/作废不重挂/换报告撤旧建新/止损 GTC/止损变化重建/缺止损保留/报告全删保留/exit 单/take_profit 不出单/无账户待命/loader 契约）。
+- **前端**：Paper 页 conditional 类型徽章+触发价列未做（本任务后端范围；订单列表目前原样透出 `order_type`/`trigger_price` 字段，功能可辨）。
+- **B1 验收第一句**（真实链路：空仓票出报告 → 模拟盘出现 conditional 单 → 盘中触发成交）依赖运行实例跑分析任务 + 盘中行情，待用户实机联调确认。
 
 ### 4.7-3 验收
 

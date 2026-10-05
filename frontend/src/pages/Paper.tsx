@@ -23,6 +23,7 @@ const ORDER_TYPE_LABEL: Record<string, string> = {
   market: '即时',
   next_open: '次日开盘',
   close: '当日收盘',
+  conditional: '条件单',
 }
 
 const STATUS_LABEL: Record<string, string> = {
@@ -1352,7 +1353,11 @@ export function Paper() {
                         </span>
                       )}
                       <span className="min-w-0 flex-1 truncate text-[11px] text-muted" title={o.reason ?? undefined}>
-                        {o.status === 'filled' && o.fill_price != null ? `@ ${fmtMoney(o.fill_price, 3)}` : o.reason ?? ''}
+                        {o.status === 'filled' && o.fill_price != null
+                          ? `@ ${fmtMoney(o.fill_price, 3)}`
+                          : o.order_type === 'conditional' && o.trigger_price != null
+                            ? `触发 ${o.trigger_op ?? '<='} ${o.trigger_price}${o.expire === 'gtc' ? ' · 长期有效' : ' · 当日有效'}`
+                            : o.reason ?? ''}
                       </span>
                       {o.status === 'pending' && (
                         <button onClick={() => cancelM.mutate(o.id)} className="shrink-0 rounded p-0.5 text-muted hover:text-foreground" title="撤单">

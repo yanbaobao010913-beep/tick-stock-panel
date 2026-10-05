@@ -1107,6 +1107,10 @@ class StrategyBacktestService:
             if unsupported:
                 return _err(f"以下卖出信号暂不支持分钟触发回放: {', '.join(unsupported)}")
         stop_loss = self._override_value(overrides, "stop_loss", s.stop_loss)
+        # B2 绝对点位 (DSA 报告点位回测): overrides 直传 MatcherConfig, 空/非法 = 不启用。
+        entry_price_abs = self._normalize_abs_price(overrides.get("entry_price"))
+        stop_price_abs = self._normalize_abs_price(overrides.get("stop_price"))
+        take_profit_price_abs = self._normalize_abs_price(overrides.get("take_profit_price"))
         take_profit = self._normalize_pct(
             self._override_value(overrides, "take_profit", getattr(s, "take_profit", None)),
             0.01,
@@ -1146,6 +1150,9 @@ class StrategyBacktestService:
                 trailing_take_profit_activate=trailing_take_profit_activate,
                 trailing_take_profit_drawdown=trailing_take_profit_drawdown,
                 max_hold_days=max_hold_days,
+                entry_price=entry_price_abs,
+                stop_price=stop_price_abs,
+                take_profit_price=take_profit_price_abs,
                 score_min=score_min,
                 score_max=score_max,
                 progress_cb=progress_cb,
@@ -1307,16 +1314,25 @@ class StrategyBacktestService:
                 return _err("正式回测区间内无数据")
             feature_width = int(panel.width)
 
+        # §4.7-2b DSA 点位 (dsa_signal_rows): 信号行自带成交日 (入场=报告日次一根、
+        # 离场=报告日次一开盘), 撮合口径在此钉死, 不随请求 matching 变化;
+        # 逐格介入价的触及/成交语义由 entry_touch 开启, 配置级 entry_price 关闭
+        # (避免全矩阵 min(open, 配置价) 覆盖逐格 ideal_buy)。
+        dsa_rows_mode = bool(s.meta.get("dsa_signal_rows"))
         matcher_config = MatcherConfig(
-            matching=config.matching,
-            entry_fill=config.entry_fill,
-            exit_fill=config.exit_fill,
+            matching="close_t" if dsa_rows_mode else config.matching,
+            entry_fill="close_t" if dsa_rows_mode else config.entry_fill,
+            exit_fill="open_t+1" if dsa_rows_mode else config.exit_fill,
             fees_pct=config.fees_pct,
             commission_pct=config.commission_pct,
             stamp_tax_pct=config.stamp_tax_pct,
             slippage_bps=config.slippage_bps,
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
+            entry_price=None if dsa_rows_mode else entry_price_abs,
+            stop_price=stop_price_abs,
+            take_profit_price=take_profit_price_abs,
+            entry_touch=dsa_rows_mode,
             trailing_stop_pct=trailing_stop,
             trailing_take_profit_activate_pct=trailing_take_profit_activate,
             trailing_take_profit_drawdown_pct=trailing_take_profit_drawdown,
@@ -1486,24 +1502,24 @@ class StrategyBacktestService:
 
             scoring = effective_scoring(s.meta.get("scoring"), overrides)
             try:
-                pipeline_config = MatrixPipelineConfig(
-                    basic_filter=basic_filter,
-                    scoring=scoring,
-                    scoring_directions=effective_scoring_directions(overrides),
-                    order_by=s.meta.get("order_by"),
-                    descending=bool(s.meta.get("descending", True)),
-                    protect_strategy_cache=prepared is not None,
-                )
-                if prepared is None:
-                    signal_matrix = MatrixStrategyPipeline().run(
-                        s.matrix_strategy,
-                        market_data,
-                        params,
-                        pipeline_config,
-                        timing_ms,
+                if dsa_rows_mode:
+                    # §4.7-2b DSA 点位: 报告物化成信号行 (不走过滤/评分管线),
+                    # 物化器内部按报告日期界过滤, 单报告脏数据跳过不拖垮整体
+                    from app.custom.dsa_points import materialize_dsa_signal_rows
+
+                    signal_matrix = materialize_dsa_signal_rows(
+                        market_data, config.start, config.end,
                     )
                 else:
-                    with prepared.compute_cache.activate(market_data):
+                    pipeline_config = MatrixPipelineConfig(
+                        basic_filter=basic_filter,
+                        scoring=scoring,
+                        scoring_directions=effective_scoring_directions(overrides),
+                        order_by=s.meta.get("order_by"),
+                        descending=bool(s.meta.get("descending", True)),
+                        protect_strategy_cache=prepared is not None,
+                    )
+                    if prepared is None:
                         signal_matrix = MatrixStrategyPipeline().run(
                             s.matrix_strategy,
                             market_data,
@@ -1511,6 +1527,15 @@ class StrategyBacktestService:
                             pipeline_config,
                             timing_ms,
                         )
+                    else:
+                        with prepared.compute_cache.activate(market_data):
+                            signal_matrix = MatrixStrategyPipeline().run(
+                                s.matrix_strategy,
+                                market_data,
+                                params,
+                                pipeline_config,
+                                timing_ms,
+                            )
             except (TypeError, ValueError) as e:
                 return _err(f"矩阵策略信号计算失败: {e}")
 
@@ -1518,7 +1543,13 @@ class StrategyBacktestService:
             sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
             sim_signal_matrix = apply_time_masks(
                 sim_signal_matrix,
-                entry_time_mask[start_id:stop_id],
+                # DSA 点位: 入场格允许落在区间末根之后一根 (报告日期界已在物化器内
+                # 完成), 不再受 [start, end] 时间掩码裁剪; 离场行照常受掩码约束
+                (
+                    np.ones(stop_id - start_id, dtype=bool)
+                    if dsa_rows_mode
+                    else entry_time_mask[start_id:stop_id]
+                ),
                 exit_time_mask[start_id:stop_id],
             )
             timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
@@ -1767,6 +1798,9 @@ class StrategyBacktestService:
         trailing_take_profit_activate,
         trailing_take_profit_drawdown,
         max_hold_days,
+        entry_price,
+        stop_price,
+        take_profit_price,
         score_min,
         score_max,
         progress_cb,
@@ -1906,6 +1940,9 @@ class StrategyBacktestService:
             slippage_bps=config.slippage_bps,
             stop_loss_pct=stop_loss,
             take_profit_pct=take_profit,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
             trailing_stop_pct=trailing_stop,
             trailing_take_profit_activate_pct=trailing_take_profit_activate,
             trailing_take_profit_drawdown_pct=trailing_take_profit_drawdown,
@@ -2411,6 +2448,18 @@ class StrategyBacktestService:
         except (TypeError, ValueError):
             return None
         return min(max(pct, min_value), max_value)
+
+    @staticmethod
+    def _normalize_abs_price(value) -> float | None:
+        """绝对价位 (B2 overrides: entry_price/stop_price/take_profit_price): 有限正数
+        才有效; 空/非法/非正 → None (= 不启用绝对价, 行为与历史版本一致)。"""
+        if value is None or value == "":
+            return None
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 and np.isfinite(price) else None
 
     @staticmethod
     def _normalize_score_range(min_value, max_value) -> tuple[float | None, float | None]:

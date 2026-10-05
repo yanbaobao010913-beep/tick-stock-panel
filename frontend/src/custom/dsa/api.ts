@@ -118,6 +118,15 @@ export interface LegacyReportDetail extends LegacyReportSummary {
 
 // ===== P5 点位模拟 (契约 §4.6) =====
 
+export interface ReportBacktestResult {
+  symbol: string
+  entry?: { date: string; price: number } | null
+  exit?: { date: string; price: number; reason: string } | null
+  return_pct?: number | null
+  holding_bars?: number
+  note?: string
+}
+
 export interface PaperSummary {
   total_return_pct?: number | null
   max_drawdown_pct?: number | null
@@ -348,4 +357,11 @@ export const dsaApi = {
   paperTrades: () => request<{ items: PaperTrade[] }>(`${PREFIX}/paper/trades`),
 
   paperOutcomes: () => request<PaperOutcomes>(`${PREFIX}/paper/outcomes`),
+
+  backtestReport: (reportId: string) =>
+    request<ReportBacktestResult>(`${PREFIX}/backtest-report`, {
+      method: 'POST',
+      body: JSON.stringify({ report_id: reportId }),
+      timeoutMs: 300_000,
+    }),
 }

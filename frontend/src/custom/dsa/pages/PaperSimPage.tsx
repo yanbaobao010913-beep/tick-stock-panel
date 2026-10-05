@@ -8,6 +8,7 @@ import { toast } from '@/components/Toast'
 import { cn } from '@/lib/cn'
 import { priceColorClass } from '@/lib/format'
 import { dsaApi, type PaperTrade, type PaperOutcome } from '../api'
+import { EXIT_REASON_LABEL } from '../labels'
 
 const primaryBtnCls =
   'inline-flex items-center gap-1.5 h-8 px-3 rounded-btn bg-accent/15 text-accent text-xs font-medium hover:bg-accent/25 transition-colors duration-150 ease-smooth disabled:opacity-50 disabled:pointer-events-none'
@@ -16,13 +17,6 @@ const tileCls = 'rounded-card border border-border bg-surface px-3.5 py-3'
 const tileLabel = 'text-[11px] text-muted'
 const tileValue = 'mt-1 text-lg font-semibold tabular-nums'
 const tileHint = 'mt-0.5 text-[11px] text-muted'
-
-const EXIT_REASON_LABEL: Record<string, string> = {
-  stop_loss: '止损',
-  trail_hit: '回撤出场',
-  window_expired: '到期强平',
-  sell_signal: '信号卖出',
-}
 
 const OUTCOME_LABEL: Record<string, { text: string; cls: string }> = {
   hit: { text: '命中', cls: 'bg-bull/10 text-bull' },

@@ -46,8 +46,11 @@ class OrderModel(BaseModel):
     side: str                       # buy / sell
     qty: int | None = None
     amount: float | None = None
-    order_type: str = "market"      # market / next_open / close
+    order_type: str = "market"      # market / next_open / close / conditional
     ref_price: float | None = None  # amount 模式折算 & 买入资金预检
+    trigger_price: float | None = None  # conditional: 触发价 (>0)
+    trigger_op: str | None = None       # conditional: "<=" / ">="
+    expire: str = "day"                 # conditional: day / gtc
 
 
 class SettingsModel(BaseModel):
@@ -157,12 +160,18 @@ def create_order(request: Request, body: OrderModel, account: str = Query(paper.
     asset_type = _resolve_asset_type(request, body.symbol)
     ref_price = body.ref_price
     if ref_price is None:
-        ref_price = _last_close(data_dir, body.symbol, asset_type)
+        # conditional 单金额折算/资金预检按触发价 (预期成交价上界); 其余按最近收盘
+        ref_price = (
+            body.trigger_price
+            if body.order_type == "conditional" and body.trigger_price is not None
+            else _last_close(data_dir, body.symbol, asset_type)
+        )
     order, err = paper.create_order(
         data_dir, body.symbol, body.side,
         account_id=acc_id,
         qty=body.qty, amount=body.amount,
         order_type=body.order_type, asset_type=asset_type, ref_price=ref_price,
+        trigger_price=body.trigger_price, trigger_op=body.trigger_op, expire=body.expire,
     )
     if err:
         raise HTTPException(status_code=400, detail=err)

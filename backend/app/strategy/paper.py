@@ -24,7 +24,8 @@
     成交/撤单 (保护单语义); 成交仍走 _fill_order 全部校验 (费用/滑点/T+1/涨跌停/资金)
   - T+1: 当日买入次一交易日方可卖 (lots 按 buy_date 记账, available = date < today);
   - 涨跌停: 触及涨停的买单 / 跌停的卖单默认拒单 (expired 留痕); 账户开启
-    queue_limit_orders 后转「排队次日重试」(转 next_open, 计顺延, 超限过期);
+    queue_limit_orders 后转「排队次日重试」(转 next_open, 计顺延, 超限过期;
+    conditional 单不转 next_open, 保持原触发条件次日重判);
   - 停牌/缺行情: 顺延, 连续顺延超过 max_postpone 日自动过期;
   - 除权: 按 ex_factor 调整持仓数量(乘 factor)与成本(除以 factor), 台账记 corp_action;
     现金分红金额不在因子数据中, 不处理。
@@ -353,11 +354,16 @@ def create_order(
     asset_type: str | None = None,
     ref_price: float | None = None,
     source: str = "manual",
+    trigger_price: float | None = None,
+    trigger_op: str | None = None,
+    expire: str = "day",
 ) -> tuple[dict | None, str | None]:
     """创建订单并校验。qty 与 amount 二选一 (amount 按参考价折算百股)。
 
-    order_type: market(即时, 盘中钩子撮合) / next_open / close。
+    order_type: market(即时, 盘中钩子撮合) / next_open / close / conditional(条件触发单)。
     ETF 即时单自动转 next_open (盘中钩子只喂股票快照)。
+    conditional 单必带 trigger_price(>0) / trigger_op(<=|>=) / expire(day|gtc);
+    触发字段用在非 conditional 单上一律拒绝 (不静默忽略错误语义)。
     返回 (order, None) 或 (None, 错误信息)。
     """
     with PAPER_LOCK:
@@ -368,8 +374,17 @@ def create_order(
             return None, "账户已冻结, 拒绝新订单"
         if side not in ("buy", "sell"):
             return None, f"side 非法: {side!r}"
-        if order_type not in ("market", "next_open", "close"):
+        if order_type not in ("market", "next_open", "close", "conditional"):
             return None, f"order_type 非法: {order_type!r}"
+        if order_type == "conditional":
+            if isinstance(trigger_price, bool) or not isinstance(trigger_price, (int, float)) or trigger_price <= 0:
+                return None, "conditional 单需要正数 trigger_price"
+            if trigger_op not in ("<=", ">="):
+                return None, f"trigger_op 非法: {trigger_op!r} (仅支持 <= / >=)"
+            if expire not in ("day", "gtc"):
+                return None, f"expire 非法: {expire!r} (仅支持 day / gtc)"
+        elif trigger_price is not None or trigger_op is not None:
+            return None, "trigger_price/trigger_op 仅 conditional 单可用"
         symbol = (symbol or "").strip()
         if not symbol:
             return None, "symbol 不能为空"
@@ -438,13 +453,17 @@ def create_order(
             "status": "pending",   # pending / filled / cancelled / expired
             "ref_price": float(ref_price) if ref_price else None,
             "postponed": 0,        # 顺延交易日计数 (停牌顺延 / 涨跌停排队共用)
-            "source": source,      # manual / auto:{rule_id}
+            "source": source,      # manual / auto:{rule_id} / dsa:{report_id}[:kind]
             "created_at": _now_iso(),
             "filled_at": None,
             "fill_price": None,
             "fees": None,
             "reason": None,
         }
+        if order_type == "conditional":
+            order["trigger_price"] = float(trigger_price)
+            order["trigger_op"] = trigger_op
+            order["expire"] = expire
         save_order(data_dir, order, account_id)
         return order, None
 
@@ -606,6 +625,15 @@ def rebuild_positions(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> d
 
 
 # ── 撮合 ────────────────────────────────────────────────
+def trigger_met(trigger_price: float, trigger_op: str, price: float) -> bool:
+    """条件触发判定 (纯函数): <= 向下触发 / >= 向上触发; 未知 op 不触发。"""
+    if trigger_op == "<=":
+        return price <= trigger_price
+    if trigger_op == ">=":
+        return price >= trigger_price
+    return False
+
+
 def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | None:
     """按指定 raw 价成交一笔订单 (费用/滑点/资金与持仓校验), 返回 fill 或 None。
 
@@ -728,15 +756,22 @@ def _expire(data_dir: Path, order: dict, reason: str, account_id: str = DEFAULT_
 
 
 def _queue_or_expire(data_dir: Path, order: dict, acc: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
-    """涨跌停拒单处理: 排队开启 → 转 next_open 次日重试 (计顺延, 超限过期); 关 → 过期。"""
+    """涨跌停拒单处理: 排队开启 → 次日重试 (计顺延, 超限过期); 关 → 过期。
+
+    conditional 单排队时保持原触发条件次日重判 (不转 next_open) —— 否则保护性
+    止损单会被静默改成次日无条件市价卖; queue 未开启时照旧过期留痕。
+    """
     postponed = int(order.get("postponed", 0))
     if acc.get("queue_limit_orders"):
         if postponed < MAX_POSTPONE_DAYS:
-            order["order_type"] = "next_open"
+            is_conditional = order.get("order_type") == "conditional"
+            if not is_conditional:
+                order["order_type"] = "next_open"
             order["postponed"] = postponed + 1
             order["reason"] = f"{reason}; 排队次日重试 ({postponed + 1}/{MAX_POSTPONE_DAYS})"
             # 排队时刻: 盘中排队的单不能按当日 (排队之前已打印的) 开盘价成交
-            order["queued_at"] = _now_iso()
+            if not is_conditional:
+                order["queued_at"] = _now_iso()
             save_order(data_dir, order, account_id)
             return
         reason = f"{reason}; 排队 {MAX_POSTPONE_DAYS} 日未成交, 过期"
@@ -777,23 +812,29 @@ def _fill_event(fill: dict, account_id: str) -> dict:
 
 
 def evaluate_intraday(data_dir: Path, snapshot: dict[str, float], account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
-    """盘中钩子: 用最新快照价撮合 pending 即时单。返回本次成交事件列表。
+    """盘中钩子: 用最新快照价撮合 pending 即时单与条件触发单。返回本次成交事件列表。
 
-    snapshot: {symbol: raw 最新价} (来自 enriched raw_close)。仅处理 market 单;
-    调用方 (quote_service) 已保证交易时段。ETF 不在快照内自然顺延。
-    事件由调用方广播 (SSE/语音/系统通知/留痕/Webhook), 域模块只产出不投递。
+    snapshot: {symbol: raw 最新价} (来自 enriched raw_close)。market 单按快照价
+    成交; conditional 单快照价满足 trigger 条件 (trigger_met) 才按快照价成交,
+    未触发保持挂单。调用方 (quote_service) 已保证交易时段。ETF 不在快照内自然
+    顺延。事件由调用方广播 (SSE/语音/系统通知/留痕/Webhook), 域模块只产出不投递。
     """
     events: list[dict] = []
     with PAPER_LOCK:
         today = cn_today().isoformat()
         pending_orders = sorted(
-            (o for o in load_orders(data_dir, account_id) if o["status"] == "pending" and o["order_type"] == "market"),
+            (o for o in load_orders(data_dir, account_id)
+             if o["status"] == "pending" and o["order_type"] in ("market", "conditional")),
             key=_order_sort_key,
         )
         for order in pending_orders:
             price = snapshot.get(order["symbol"])
             if price is None or price <= 0:
                 continue  # 无快照顺延
+            if order["order_type"] == "conditional" and not trigger_met(
+                float(order["trigger_price"]), str(order["trigger_op"]), float(price),
+            ):
+                continue  # 未触发保持挂单
             fill = _fill_order(data_dir, order, float(price), today, account_id)
             if fill is not None:
                 events.append(_fill_event(fill, account_id))
@@ -815,7 +856,7 @@ def read_daily_bar(data_dir: Path, symbol: str, asset_type: str, day: str) -> di
         df = (
             pl.scan_parquet((base / "**" / "*.parquet").as_posix())
             .filter((pl.col("symbol") == symbol) & (pl.col("date") == _date.fromisoformat(day)))
-            .select(["open", "close"])
+            .select(["open", "high", "low", "close"])
             .collect()
         )
     except Exception as e:
@@ -823,7 +864,12 @@ def read_daily_bar(data_dir: Path, symbol: str, asset_type: str, day: str) -> di
         return None
     if df.is_empty():
         return None
-    return {"open": float(df["open"][0]), "close": float(df["close"][0])}
+    row = df.row(0, named=True)
+
+    def _f(key: str) -> float | None:
+        return None if row.get(key) is None else float(row[key])
+
+    return {"open": _f("open"), "high": _f("high"), "low": _f("low"), "close": _f("close")}
 
 
 def _prev_close(data_dir: Path, symbol: str, asset_type: str, day: str) -> float | None:
@@ -893,10 +939,12 @@ def _factor_on(data_dir: Path, symbol: str, asset_type: str, day: str) -> float 
 def _placed_after_price_time(order: dict, day: str) -> bool:
     """订单 (盘中排队的按排队时刻) 是否晚于 day 结算价格的打印时刻。
 
-    next_open 用当日 09:30 开盘价, close / market 兜底用当日 15:00 收盘价。下单或
-    排队发生在同一交易日该时刻之后, 说明这个价格在下单时已经打印过, 按它成交等于
-    拿已知价格回填 (次日开盘单的口径是次一交易日 raw_open), 应留到下一交易日结算。
-    更早日期的订单不受影响; 时间戳缺失或无法解析时不拦截 (沿用原行为)。
+    next_open / conditional 用当日 09:30 (conditional 结算按当日 low/high 全天
+    判穿越, 开盘后创建的部分区间在下单之前, 不能回填), close / market 兜底用
+    当日 15:00 收盘价。下单或排队发生在同一交易日该时刻之后, 说明这个价格在下单
+    时已经打印过, 按它成交等于拿已知价格回填 (次日开盘单的口径是次一交易日
+    raw_open), 应留到下一交易日结算。更早日期的订单不受影响; 时间戳缺失或无法
+    解析时不拦截 (沿用原行为)。
     """
     stamp = order.get("queued_at") or order.get("created_at")
     try:
@@ -907,17 +955,24 @@ def _placed_after_price_time(order: dict, day: str) -> bool:
         ts = ts.astimezone(CN_TZ)
     if ts.date().isoformat() != day:
         return False
-    price_time = _SESSION_OPEN if order.get("order_type") == "next_open" else _SESSION_CLOSE
+    price_time = (
+        _SESSION_OPEN
+        if order.get("order_type") in ("next_open", "conditional")
+        else _SESSION_CLOSE
+    )
     return ts.time() >= price_time
 
 
 def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
     """盘后管道阶段: 撮合顺延单 → 除权调整 → 定版净值。幂等 (重跑同日安全)。
 
-    撮合顺序: close 单用 raw_close; next_open 单用 raw_open; 仍 pending 的
-    market 单 (当日无快照) 也按 raw_close 兜底成交 — 避免停牌外无限顺延。
-    当日开盘后才下 / 排队的 next_open 单, 以及收盘后才下的 close / market 单,
-    当日不成交也不计顺延, 留到下一交易日 (见 _placed_after_price_time)。
+    撮合顺序: close 单用 raw_close; next_open 单用 raw_open; conditional 单按
+    当日 low/high 判定穿越, 成交价 min(open, trigger) (<= 向) / max(open, trigger)
+    (>= 向) —— 跳空按开盘价 (DSA 口径), expire=day 未触发作废、gtc 保持挂单;
+    仍 pending 的 market 单 (当日无快照) 也按 raw_close 兜底成交 — 避免停牌外
+    无限顺延。当日开盘后才下 / 排队的 next_open / conditional 单, 以及收盘后才下
+    的 close / market 单, 当日不成交也不计顺延, 留到下一交易日 (见
+    _placed_after_price_time)。
     """
     summary = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "account": account_id}
     with PAPER_LOCK:
@@ -930,6 +985,8 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
         )
         for order in pending_orders:
             bar = read_daily_bar(data_dir, order["symbol"], order.get("asset_type", "stock"), day)
+            if order["order_type"] == "conditional" and (bar is None or bar.get("low") is None or bar.get("high") is None):
+                bar = None  # 条件单需要完整 OHLC 判穿越, 缺 low/high 视同缺行情
             if bar is None:
                 order["postponed"] = int(order.get("postponed", 0)) + 1
                 if order["postponed"] > MAX_POSTPONE_DAYS:
@@ -942,6 +999,24 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
                 continue
             if _placed_after_price_time(order, day):
                 continue  # 下单/排队时该价已打印, 留到下一交易日 (不计顺延)
+            if order["order_type"] == "conditional":
+                trigger = float(order["trigger_price"])
+                op = str(order["trigger_op"])
+                low, high = float(bar["low"]), float(bar["high"])
+                crossed = low <= trigger if op == "<=" else high >= trigger
+                if crossed:
+                    # 盘中触发过则早已成交; 此处兜底盘中无快照/未跑钩子的单
+                    raw = min(float(bar["open"]), trigger) if op == "<=" else max(float(bar["open"]), trigger)
+                    before = order["status"]
+                    if _fill_order(data_dir, order, raw, day, account_id) is not None:
+                        summary["filled"] += 1
+                    elif before == "pending" and order["status"] == "expired":
+                        summary["expired"] += 1
+                elif order.get("expire", "day") == "day":
+                    _expire(data_dir, order, "条件触发单当日未触发, 作废 (expire=day)", account_id)
+                    summary["expired"] += 1
+                # gtc 未触发: 保持挂单, 次日继续判定
+                continue
             # next_open 用开盘价; close 与 market 兜底用收盘价
             raw = bar["open"] if order["order_type"] == "next_open" else bar["close"]
             before = order["status"]

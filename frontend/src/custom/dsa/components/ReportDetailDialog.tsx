@@ -1,7 +1,12 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { FlaskConical, Loader2 } from 'lucide-react'
 import { Modal } from '@/components/Modal'
 import { MarkdownRenderer } from '@/components/financials/MarkdownRenderer'
-import { dsaApi, type ReportDetail, type LegacyReportDetail, type ReportPoints } from '../api'
+import { cn } from '@/lib/cn'
+import { priceColorClass } from '@/lib/format'
+import { dsaApi, type ReportDetail, type LegacyReportDetail, type ReportPoints, type ReportBacktestResult } from '../api'
+import { EXIT_REASON_LABEL } from '../labels'
 
 function PointItem({ label, value, tone }: { label: string; value?: number | null; tone?: 'danger' | 'accent' }) {
   if (value == null) return null
@@ -38,6 +43,8 @@ export function ReportDetailDialog({ kind, id, onClose }: Props) {
     queryKey: ['dsa', kind === 'report' ? 'report-detail' : 'legacy-report-detail', id],
     queryFn: () => (kind === 'report' ? dsaApi.reportDetail(id) : dsaApi.legacyReportDetail(id)),
   })
+  const [btRunning, setBtRunning] = useState(false)
+  const [btResult, setBtResult] = useState<ReportBacktestResult | null>(null)
 
   const detail = data as ReportDetail | LegacyReportDetail | undefined
   const isNew = kind === 'report'
@@ -53,6 +60,16 @@ export function ReportDetailDialog({ kind, id, onClose }: Props) {
         }
       : undefined
   const pd = newDetail?.phase_decision
+
+  const runBacktest = async () => {
+    setBtRunning(true)
+    setBtResult(null)
+    try {
+      setBtResult(await dsaApi.backtestReport(id))
+    } catch { /* toast 已由 request 弹出 */ } finally {
+      setBtRunning(false)
+    }
+  }
 
   return (
     <Modal
@@ -73,12 +90,48 @@ export function ReportDetailDialog({ kind, id, onClose }: Props) {
             {isNew ? '' : ' · DSA 历史（只读）'}
           </span>
         )}
+        {isNew && detail && (
+          <button
+            type="button"
+            onClick={runBacktest}
+            disabled={btRunning}
+            className="ml-auto inline-flex items-center gap-1.5 h-7 px-2.5 rounded-btn bg-accent/15 text-accent text-xs font-medium hover:bg-accent/25 transition-colors disabled:opacity-50"
+            title="用 TSP 核心回测引擎（含费用/滑点）按本报告的绝对点位回测"
+          >
+            {btRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />}
+            点位回测
+          </button>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
         {isLoading && <div className="text-xs text-muted py-8 text-center">加载中…</div>}
 
         {detail && <PointsCard points={points} />}
+
+        {btResult && (
+          <div className="rounded-card border border-border bg-elevated/40 px-4 py-3 text-xs space-y-1.5">
+            <div className="font-medium text-foreground">点位回测（TSP 核心引擎，含费用/滑点）</div>
+            {btResult.entry ? (
+              <>
+                <div className="text-secondary">
+                  建仓：{btResult.entry.date} @ {btResult.entry.price}
+                  {btResult.exit
+                    ? ` → 出场：${btResult.exit.date} @ ${btResult.exit.price}（${EXIT_REASON_LABEL[btResult.exit.reason] ?? btResult.exit.reason}）`
+                    : ' → 数据末尾仍持仓'}
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className={cn('font-semibold', priceColorClass(btResult.return_pct))}>
+                    收益 {btResult.return_pct != null ? `${btResult.return_pct >= 0 ? '+' : ''}${btResult.return_pct.toFixed(2)}%` : '—'}
+                  </span>
+                  {btResult.holding_bars != null && <span className="text-muted">持有 {btResult.holding_bars} 根日K</span>}
+                </div>
+              </>
+            ) : (
+              <div className="text-muted">{btResult.note || '未触及介入价，未建仓'}</div>
+            )}
+          </div>
+        )}
 
         {pd && (pd.immediate_action || pd.action_window || pd.next_check_time || (pd.watch_conditions?.length ?? 0) > 0 || (pd.risk_conditions?.length ?? 0) > 0) && (
           <div className="rounded-card border border-border bg-elevated/40 px-4 py-3 text-xs space-y-1.5">

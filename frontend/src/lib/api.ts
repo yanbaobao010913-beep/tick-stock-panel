@@ -1124,9 +1124,13 @@ export interface PaperOrder {
   asset_type: string
   side: 'buy' | 'sell'
   qty: number
-  order_type: 'market' | 'next_open' | 'close'
+  order_type: 'market' | 'next_open' | 'close' | 'conditional'
   status: 'pending' | 'filled' | 'cancelled' | 'expired'
   ref_price?: number | null
+  /** conditional 单: 触发价/方向/有效期 (dsa-migration §4.7-1) */
+  trigger_price?: number | null
+  trigger_op?: '<=' | '>=' | null
+  expire?: 'day' | 'gtc' | null
   postponed: number
   source: string
   created_at: string
