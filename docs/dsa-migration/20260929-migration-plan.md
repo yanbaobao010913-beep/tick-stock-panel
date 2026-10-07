@@ -1,5 +1,7 @@
 # DSA → TSP 迁移总计划与前后端契约（P1-P3 执行层）
 
+> **2026-10-05 下线说明（用户决定）**：独立“点位模拟”功能已移除，包括 `/dsa/paper` 页面、`/api/ext/dsa/paper/*` API 和每日自动模拟调度。§4.6 留作历史设计记录，不再表示当前可用功能；原 `data/user_data/dsa_paper/` 数据保留，不迁移、不清理。点位回测继续使用回测页的“DSA 点位”策略（§4.7-2b）与报告详情的核心引擎回测入口。核心模拟盘及 DSA 报告挂单桥接不受此次下线影响。
+
 > 定稿：2026-09-29。前端：Kimi（本仓 `frontend/src/custom/dsa/`）；后端：GLM（本仓 `backend/app/custom/dsa_*` 扩展模块）。
 > **上位文档（权威，先读）**：`daily_stock_analysis/docs/tasks/tsp-migration-plan-20260929.md`（B 方案 8 项补齐清单 + 阶段 0-5 + 止损点）与 `docs/research/tsp-migration-assessment-20260929.md`。本文是其中 #2/#3 项的前后端契约细化，与上位文档冲突时以上位文档为准并回来改本文。
 > 仓库已从 `D:\Documents\_scout\tick-stock-panel` 挪到 `D:\Documents\tick-stock-panel`（2026-09-29 用户拍板；backend/.venv 已删，GLM 首次 `uv sync` 重建）。

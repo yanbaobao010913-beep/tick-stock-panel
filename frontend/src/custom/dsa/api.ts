@@ -116,7 +116,7 @@ export interface LegacyReportDetail extends LegacyReportSummary {
   markdown: string
 }
 
-// ===== P5 点位模拟 (契约 §4.6) =====
+// ===== 报告点位回测（核心回测引擎） =====
 
 export interface ReportBacktestResult {
   symbol: string
@@ -125,62 +125,6 @@ export interface ReportBacktestResult {
   return_pct?: number | null
   holding_bars?: number
   note?: string
-}
-
-export interface PaperSummary {
-  total_return_pct?: number | null
-  max_drawdown_pct?: number | null
-  win_rate?: number | null
-  closed: number
-  open: number
-  skipped: number
-}
-
-export interface PaperEquityPoint {
-  date: string
-  equity: number
-  benchmark?: number | null
-}
-
-export interface PaperOverview {
-  state: { inception_date: string; initial_capital: number; max_slots: number }
-  summary: PaperSummary
-  equity: PaperEquityPoint[]
-}
-
-export interface PaperTrade {
-  symbol: string
-  name?: string | null
-  entry_date: string
-  entry_price: number
-  shares: number
-  exit_date?: string | null
-  exit_price?: number | null
-  exit_reason?: string | null
-  return_pct?: number | null
-  status: 'open' | 'closed' | 'skipped'
-}
-
-export type OutcomeValue = 'hit' | 'miss' | 'neutral' | 'unable'
-
-export interface PaperOutcome {
-  report_id: string
-  symbol: string
-  created_at: string
-  direction: string
-  horizon: number
-  outcome: OutcomeValue
-  exit_reason?: string | null
-  return_pct?: number | null
-}
-
-export interface PaperOutcomes {
-  items: PaperOutcome[]
-  stats: {
-    hit_rate?: number | null
-    n: number
-    by_horizon?: Record<string, { hit_rate?: number | null; n: number }>
-  }
 }
 
 // ===== P2 次日盯盘 (契约 §4) =====
@@ -348,15 +292,6 @@ export const dsaApi = {
 
   alertAuditDetail: (day: string) =>
     request<{ date: string; markdown: string }>(`${PREFIX}/alert-audit/${encodeURIComponent(day)}`),
-
-  paperRun: () =>
-    request<{ ok: boolean; episodes: number; ran_at: string }>(`${PREFIX}/paper/run`, { method: 'POST', body: '{}', timeoutMs: 300_000 }),
-
-  paperOverview: () => request<PaperOverview>(`${PREFIX}/paper/overview`),
-
-  paperTrades: () => request<{ items: PaperTrade[] }>(`${PREFIX}/paper/trades`),
-
-  paperOutcomes: () => request<PaperOutcomes>(`${PREFIX}/paper/outcomes`),
 
   backtestReport: (reportId: string) =>
     request<ReportBacktestResult>(`${PREFIX}/backtest-report`, {

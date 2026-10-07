@@ -9,8 +9,7 @@ DSA 分析报告物化成信号行 (本文件的 compute_signals 不参与回测
   - 入场信号行放在报告日次一交易日, 逐格注入 ideal_buy: 触及 (low <= ideal_buy)
     才成交, 成交价 min(当日 open, ideal_buy), 未触及不建仓
   - 报告 stop_loss / take_profit 注入为逐仓位绝对风控线 (固定线成交, 非移动
-    止盈 —— 与 DSA trailing 的口径差异如实声明; 要看 trailing 效果用扩展版
-    dsa_paper)
+    止盈 —— 与 DSA trailing 的口径差异如实声明)
 
 出场优先级 (引擎口径): 绝对止损/止盈线 > 移动参数 > 卖出类建议 (次日开盘) >
 max_hold (10 根, DSA §4.6-2 持有窗) > 数据末尾。

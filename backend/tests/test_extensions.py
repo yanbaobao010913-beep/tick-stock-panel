@@ -25,6 +25,23 @@ class PrefixFormatter(NotificationFormatter):
         return f"{self.prefix}{event['message']}"
 
 
+def test_dsa_paper_retired_without_removing_core_backtest_extension() -> None:
+    """实际扩展发现不再注册旧模拟 API, 也不再发现其启动调度模块。"""
+    from app.extensions.loader import _custom_module_names
+
+    assert "app.custom.dsa_paper" not in _custom_module_names()
+    app = FastAPI()
+    registry, errors = configure_backend_extensions(app)
+
+    assert "dsa.paper" not in registry.extension_ids()
+    assert "dsa.backtest" in registry.extension_ids()
+    assert "dsa.paper-bridge" in registry.extension_ids()
+    assert not any(error.module == "app.custom.dsa_paper" for error in errors)
+    paths = {route.path for route in app.routes}
+    assert not any(path.startswith("/api/ext/dsa/paper/") for path in paths)
+    assert "/api/ext/dsa/backtest-report" in paths
+
+
 class BrokenFormatter(NotificationFormatter):
     def format_message(self, event: dict, context: NotificationFormatContext) -> str:
         del event, context
