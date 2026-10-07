@@ -29,6 +29,39 @@ _APP_NAME = "TickFlow 股票面板"
 _BASE_PORT = 3018
 _PORT_PROBE_RANGE = 50  # 从 3018 起最多试 50 个端口
 
+# 加载页: 双击后立即显示, 后端就绪后由 _open_window 的后台线程 load_url 切换
+_LOADING_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
+    font-family:"Microsoft YaHei",system-ui,sans-serif;
+    display:flex;align-items:center;justify-content:center}
+  .box{text-align:center}
+  .spin{width:44px;height:44px;margin:0 auto 22px;border-radius:50%;
+    border:3px solid #21262d;border-top-color:#2f81f7;animation:s 1s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+  h1{font-size:18px;font-weight:500;margin:0 0 10px}
+  p{font-size:12px;color:#8b949e;margin:0}
+</style></head><body><div class="box">
+  <div class="spin"></div>
+  <h1>TickFlow 正在加载…</h1>
+  <p>启动时需要同步行情数据，约需 1 分钟，请稍候</p>
+</div></body></html>"""
+
+# 失败页: 后端 150s 内未就绪时兜底, 提示去看日志
+_FAILED_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
+    font-family:"Microsoft YaHei",system-ui,sans-serif;
+    display:flex;align-items:center;justify-content:center}
+  .box{text-align:center;max-width:420px}
+  h1{font-size:18px;font-weight:500;margin:0 0 12px;color:#f85149}
+  p{font-size:13px;color:#8b949e;margin:0 0 6px;line-height:1.7}
+</style></head><body><div class="box">
+  <h1>TickFlow 启动超时</h1>
+  <p>后端未在预期时间内就绪，请关闭窗口后重新打开。</p>
+  <p>反复失败时查看日志：data\\desktop.log</p>
+</div></body></html>"""
+
 
 def _ensure_data_dir_writable() -> None:
     """确保用户数据目录可写 (lifespan 会创建子目录, 这里只验证根目录)。
@@ -267,21 +300,50 @@ def _wait_for_server(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def _open_window(url: str) -> None:
-    """主线程: 用 pywebview 打开桌面窗口。"""
+def _open_window(port: int) -> None:
+    """主线程: 先显示加载页, 后端就绪后自动切到正式界面 (DSA 式加载体验)。
+
+    双击后立即弹窗给出反馈, 消除启动期(行情同步, 冷启动 1-2 分钟)毫无
+    反馈的空窗感; 就绪后 load_url 无缝切换, 不再需要 main 里先等 60s 才开窗。
+    """
     import webview  # type: ignore[import-not-found]
 
     window = webview.create_window(
         _APP_NAME,
-        url,
+        html=_LOADING_HTML,
         width=1440,
         height=900,
         min_size=(1024, 700),
+        background_color="#0d1117",
         # 桌面版固定单窗口, 禁用外部浏览器跳转
         confirm_close=False,
     )
-    # pywebview 会阻塞主线程直到窗口关闭
-    webview.start(debug=False)
+
+    def _on_gui_ready() -> None:
+        # 启动器(scripts\desktop-hidden.vbs)以 SW_HIDE 隐藏控制台, Windows 会把
+        # 隐藏标志传给进程第一个窗口(即本窗口), 故 GUI 循环就绪后显式 show
+        try:
+            window.show()
+        except Exception:
+            pass
+        # 冷启动含 lifespan 初始化 + 启动期全市场行情同步, 给足 150s
+        if _wait_for_server(port, timeout=150.0):
+            try:
+                window.load_url(f"http://127.0.0.1:{port}")
+                logger.info("加载完成, 已切换到正式界面")
+            except Exception:
+                # 窗口在加载完成前被用户关掉: webview.start 已/即将返回, 静默即可
+                logger.info("窗口已关闭, 跳过界面切换")
+        else:
+            logger.error("后端启动超时, 窗口停留在失败提示页")
+            try:
+                window.load_html(_FAILED_HTML)
+                window.show()
+            except Exception:
+                pass
+
+    # webview.start(func): GUI 事件循环就绪后在后台线程执行 func
+    webview.start(_on_gui_ready, debug=False)
 
 
 def main() -> int:
@@ -319,15 +381,9 @@ def main() -> int:
         )
         server_thread.start()
 
-        # 轮询 health 接口等后端就绪 (含 lifespan 初始化, 最多 60s)
-        if not _wait_for_server(port, timeout=60.0):
-            logger.error("后端启动超时, 桌面版退出")
-            _release_single_instance()
-            return 1
-
-        url = f"http://127.0.0.1:{port}"
-        logger.info("打开桌面窗口: %s", url)
-        _open_window(url)
+        # 立即弹加载窗口 (DSA 式: 双击马上有反馈), 后端就绪后窗口自动
+        # 切到正式界面; 超时则窗口内显示失败提示, 不再让主流程先干等 60s
+        _open_window(port)
 
         # 窗口关闭后, 进程退出 (daemon 线程会被回收)
         logger.info("窗口已关闭, 桌面版退出")
