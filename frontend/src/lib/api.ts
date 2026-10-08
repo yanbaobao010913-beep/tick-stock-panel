@@ -2824,7 +2824,13 @@ export const api = {
     request<{ removed: number }>('/api/watchlist', { method: 'DELETE' }),
   watchlistQuotes: () => request<{ quotes: Quote[] }>('/api/watchlist/quotes'),
   watchlistEnriched: (extColumns?: string) =>
-    request<{ rows: any[]; as_of: string | null; elapsed_ms: number }>(
+    request<{
+      rows: any[]
+      as_of: string | null
+      elapsed_ms: number
+      /** 按资产类型的行情日期 (ISO); 缺失 (旧后端) 时前端按不新鲜处理 */
+      dates?: { stock: string | null; etf: string | null; index: string | null }
+    }>(
       extColumns
         ? `/api/watchlist/enriched?ext_columns=${encodeURIComponent(extColumns)}`
         : '/api/watchlist/enriched',
@@ -3176,6 +3182,10 @@ export const api = {
 
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(
     '/api/pipeline/run', { method: 'POST' },
+  ),
+  /** 独立同步除权因子 (全历史 + 受影响个股 enriched 局部重算), 与管道共用任务槽 */
+  pipelineAdjFactorRun: () => request<{ job_id: string; reused: boolean }>(
+    '/api/pipeline/adj-factor/run', { method: 'POST' },
   ),
   pipelineJob: (id: string) => request<PipelineJob>(`/api/pipeline/jobs/${id}`),
   /** 手动停止一个 running/pending 的同步任务 (协作式: 当前分块完成后线程自行退出) */
@@ -4073,13 +4083,15 @@ export interface PipelineJob {
   finished_at: string | null
   duration_s: number | null
   result: {
-    universe_size: number
-    daily_days: number
-    adj_factor_symbols: number
-    enriched_days: number
+    universe_size?: number
+    daily_days?: number
+    adj_factor_symbols?: number
+    /** 独立除权因子同步: 本轮写入/合并的因子行数 */
+    adj_written?: number
+    enriched_days?: number
     index_count?: number
     index_daily_rows?: number
-    minute_rows: number
+    minute_rows?: number
     skipped_stages?: string[]
   } | null
   error: string | null

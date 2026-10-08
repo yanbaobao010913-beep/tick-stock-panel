@@ -15,6 +15,7 @@ import * as echarts from 'echarts'
 import { Banknote, ChevronDown, ChevronUp, CircleDollarSign, GitCompare, PieChart, Plus, RefreshCw, Settings, TrendingUp, Wallet, X } from 'lucide-react'
 import { api, type PaperCompareRow, type PaperFill, type PaperOrder } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
+import { useQuoteStatus } from '@/lib/useSharedQueries'
 import { cn } from '@/lib/cn'
 import { fmtPct, priceColorClass } from '@/lib/format'
 import { boardTag } from '@/components/stock-table/primitives'
@@ -1064,8 +1065,15 @@ function CompareView({ onCreateSingle }: { onCreateSingle: () => void }) {
   const [sort, setSort] = useState<{ key: CmpSortKey; desc: boolean }>({ key: 'pnl_pct', desc: true })
   const onSortCmp = (k: CmpSortKey) =>
     setSort(s => (s.key === k ? { key: k, desc: !s.desc } : { key: k, desc: k !== 'name' }))
-  // 60s 轻轮询: 盘中自动跟单下单 / 盘后结算后榜单自然刷新 (保留旧数据防闪烁)
-  const cmpQ = useQuery({ queryKey: QK.paperCompare, queryFn: api.paperCompare, refetchInterval: 60_000 })
+  // 60s 轻轮询: 盘中自动跟单下单 / 盘后结算后榜单自然刷新 (保留旧数据防闪烁)。
+  // 非交易时段榜单不变, 降为 5 分钟兜底 (字段缺失保持 60s)
+  const { data: quoteStatus } = useQuoteStatus()
+  const cmpQ = useQuery({
+    queryKey: QK.paperCompare,
+    queryFn: api.paperCompare,
+    refetchInterval: () => (quoteStatus?.is_trading_hours === false ? 300_000 : 60_000),
+    placeholderData: (prev: any) => prev,
+  })
 
   const rows = cmpQ.data?.accounts ?? []
   // 收益口径固定排序: 统计卡「收益最高」与净值叠加「收益前 8 名」不受表头排序影响
@@ -1610,6 +1618,16 @@ function AccountPanel({ acc, name }: { acc: string; name?: string }) {
   const navQ = useQuery({ queryKey: QK.paperNav(acc), queryFn: () => api.paperNav(acc) })
   const statsQ = useQuery({ queryKey: QK.paperStats(acc), queryFn: () => api.paperStats(acc) })
 
+  // 持仓代码→名称 (#454): 就地显示名称, 不用切页查询。股票/ETF/指数都覆盖。
+  const holdingSymbols = (overviewQ.data?.holdings ?? []).map(h => h.symbol)
+  const namesQ = useQuery({
+    queryKey: ['instrument-names', holdingSymbols.join(',')],
+    queryFn: () => api.instrumentNames(holdingSymbols),
+    enabled: holdingSymbols.length > 0,
+    staleTime: 300000,
+  })
+  const symbolNames = namesQ.data?.names ?? {}
+
   // 'paper' 前缀兜底失效: 覆盖全部账户的全部查询 (订单变动可能影响净值/统计)
   const invalidateAll = () => qc.invalidateQueries({ queryKey: QK.paperAll })
 
@@ -1624,6 +1642,22 @@ function AccountPanel({ acc, name }: { acc: string; name?: string }) {
 
   if (overviewQ.isLoading) {
     return <div className="py-8 text-center text-xs text-muted">加载中…</div>
+  }
+  // 请求失败与「未开户」分开呈现: 失败给错误态 + 重试, 不伪装成未初始化
+  if (overviewQ.isError || !overviewQ.data) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-8">
+        <span className="text-xs text-secondary">账户数据加载失败，请重试</span>
+        <button
+          type="button"
+          onClick={() => overviewQ.refetch()}
+          disabled={overviewQ.isFetching}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-accent transition-colors hover:bg-elevated disabled:opacity-50"
+        >
+          重试
+        </button>
+      </div>
+    )
   }
   const ov = overviewQ.data
   if (!ov?.initialized) {
@@ -1733,7 +1767,12 @@ function AccountPanel({ acc, name }: { acc: string; name?: string }) {
                   <tbody className="font-mono">
                     {holdings.map(h => (
                       <tr key={h.symbol} className="border-t border-border/50 transition-colors hover:bg-elevated/40">
-                        <td className="py-1.5 font-sans">{h.symbol}</td>
+                        <td className="py-1.5 font-sans">
+                          {h.symbol}
+                          {symbolNames[h.symbol] && (
+                            <span className="ml-1.5 text-[10px] text-muted">{symbolNames[h.symbol]}</span>
+                          )}
+                        </td>
                         <td className="py-1.5 text-right">{h.qty}</td>
                         <td className="py-1.5 text-right text-muted">{h.available_qty}</td>
                         <td className="py-1.5 text-right">{fmtMoney(h.avg_cost, 3)}</td>
