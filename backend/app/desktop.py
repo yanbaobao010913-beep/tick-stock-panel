@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import html
 import logging
 import socket
@@ -22,7 +23,6 @@ import sys
 import threading
 import time
 import traceback
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ _LOADING_HTML = """<!doctype html><html><head><meta charset="utf-8">
   p{font-size:12px;color:#8b949e;margin:0}
 </style></head><body><div class="box">
   <div class="spin"></div>
-  <h1>TickFlow 正在加载…</h1>
+  <h1>TSP 正在加载…</h1>
   <p>启动时需要同步行情数据，约需 1 分钟，请稍候</p>
 </div></body></html>"""
 
@@ -53,10 +53,10 @@ _LOADING_HTML = """<!doctype html><html><head><meta charset="utf-8">
 # 不让用户对着笼统的"超时"猜。纯文本入参, 函数内转义, \n 渲染为换行。
 def _failed_html(reason: str | None = None) -> str:
     if reason is None:
-        title = "TickFlow 启动超时"
+        title = "TSP 启动超时"
         body = "<p>后端未在预期时间内就绪，请关闭窗口后重新打开。</p>"
     else:
-        title = "TickFlow 启动失败"
+        title = "TSP 启动失败"
         body = f"<p>{html.escape(reason).replace(chr(10), '<br>')}</p>"
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <style>
@@ -87,7 +87,7 @@ def _ensure_data_dir_writable() -> None:
         probe = data_root / ".write_probe"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink(missing_ok=True)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.error("数据目录不可写, 桌面版无法运行: %s (%s)", data_root, e)
         raise
 
@@ -123,10 +123,8 @@ def _release_single_instance() -> None:
     from app.config import settings
 
     lock_path = settings.data_dir / ".desktop.lock"
-    try:
+    with contextlib.suppress(Exception):
         lock_path.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _precheck_mining_lock() -> str | None:
@@ -174,7 +172,6 @@ def _guard_streams() -> None:
     修法: console=False 下把 stdout/stderr 换成丢弃写入的空对象 (devnull),
     让 logging / reconfigure / 任何 print 都安全落地。console=True 不动 (有真控制台)。
     """
-    import os
 
     class _NullStream:
         """丢弃所有写入的空流 (替代 None 的 stdout/stderr)。"""
@@ -333,8 +330,8 @@ def _wait_for_server(
     调用方抛异常, 只表现为 server.run() 正常返回) —— 此时不可能出现就绪,
     立即返回 False, 不再傻等满 timeout 把「启动失败」伪装成「超时」。
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     url = f"http://127.0.0.1:{port}/health"
     deadline = time.monotonic() + timeout
@@ -399,16 +396,14 @@ def _open_window(
     def _on_gui_ready() -> None:
         # 启动器(scripts\desktop-hidden.vbs)以 SW_HIDE 隐藏控制台, Windows 会把
         # 隐藏标志传给进程第一个窗口(即本窗口), 故 GUI 循环就绪后显式 show
-        try:
+        with contextlib.suppress(Exception):
             window.show()
-        except Exception:
-            pass
         # 冷启动含 lifespan 初始化 + 启动期全市场行情同步, 给足 150s
         if _wait_for_server(port, timeout=150.0, done_event=ready_event):
             try:
                 window.load_url(f"http://127.0.0.1:{port}")
                 logger.info("加载完成, 已切换到正式界面")
-            except Exception:
+            except Exception:  # noqa: BLE001 -- 窗口关闭竞态, 任何异常都等价于跳过切换
                 # 窗口在加载完成前被用户关掉: webview.start 已/即将返回, 静默即可
                 logger.info("窗口已关闭, 跳过界面切换")
         else:
@@ -420,11 +415,9 @@ def _open_window(
             else:
                 reason = None
             logger.error("后端未就绪 (reason=%s), 窗口切换到失败提示页", reason)
-            try:
+            with contextlib.suppress(Exception):
                 window.load_html(_failed_html(reason))
                 window.show()
-            except Exception:
-                pass
 
     # webview.start(func): GUI 事件循环就绪后在后台线程执行 func
     webview.start(_on_gui_ready, debug=False)
@@ -445,7 +438,7 @@ def main() -> int:
 
     try:
         _ensure_data_dir_writable()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- 具体原因已在 _ensure_data_dir_writable 内部落日志
         # 数据目录不可写是致命错误, 无法继续
         return 1
 
