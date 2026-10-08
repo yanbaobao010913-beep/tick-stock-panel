@@ -131,11 +131,18 @@ function NewAnalysisDialog({ onClose, onCreated }: { onClose: () => void; onCrea
 // ===== 任务进度卡 =====
 
 function TaskProgressCard({ taskId, onDone }: { taskId: string; onDone: () => void }) {
+  const queryClient = useQueryClient()
   const { data: task } = useQuery({
     queryKey: ['dsa', 'analysis-task', taskId],
     queryFn: () => dsaApi.analysisTask(taskId),
     refetchInterval: (q) => (q.state.data?.status === 'running' ? 2000 : false),
   })
+
+  // 每完成一只就刷新报告列表，不等整批结束
+  const doneCount = task?.done ?? 0
+  useEffect(() => {
+    if (doneCount > 0) queryClient.invalidateQueries({ queryKey: ['dsa', 'reports'] })
+  }, [doneCount, queryClient])
 
   useEffect(() => {
     if (task && task.status !== 'running') onDone()
