@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import html
 import logging
 import socket
 import sys
@@ -47,18 +48,27 @@ _LOADING_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <p>启动时需要同步行情数据，约需 1 分钟，请稍候</p>
 </div></body></html>"""
 
-# 失败页: 后端 150s 内未就绪时兜底, 提示去看日志
-_FAILED_HTML = """<!doctype html><html><head><meta charset="utf-8">
+# 失败页: 后端未就绪时的兜底。reason 为空 = 等满 150s 的超时; 有值 = 已定位的
+# 启动失败原因 (如挖掘锁被其他后端实例占用), 直接告诉用户下一步怎么做,
+# 不让用户对着笼统的"超时"猜。纯文本入参, 函数内转义, \n 渲染为换行。
+def _failed_html(reason: str | None = None) -> str:
+    if reason is None:
+        title = "TickFlow 启动超时"
+        body = "<p>后端未在预期时间内就绪，请关闭窗口后重新打开。</p>"
+    else:
+        title = "TickFlow 启动失败"
+        body = f"<p>{html.escape(reason).replace(chr(10), '<br>')}</p>"
+    return f"""<!doctype html><html><head><meta charset="utf-8">
 <style>
-  html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
+  html,body{{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
     font-family:"Microsoft YaHei",system-ui,sans-serif;
-    display:flex;align-items:center;justify-content:center}
-  .box{text-align:center;max-width:420px}
-  h1{font-size:18px;font-weight:500;margin:0 0 12px;color:#f85149}
-  p{font-size:13px;color:#8b949e;margin:0 0 6px;line-height:1.7}
+    display:flex;align-items:center;justify-content:center}}
+  .box{{text-align:center;max-width:460px}}
+  h1{{font-size:18px;font-weight:500;margin:0 0 12px;color:#f85149}}
+  p{{font-size:13px;color:#8b949e;margin:0 0 6px;line-height:1.7}}
 </style></head><body><div class="box">
-  <h1>TickFlow 启动超时</h1>
-  <p>后端未在预期时间内就绪，请关闭窗口后重新打开。</p>
+  <h1>{title}</h1>
+  {body}
   <p>反复失败时查看日志：data\\desktop.log</p>
 </div></body></html>"""
 
@@ -117,6 +127,37 @@ def _release_single_instance() -> None:
         lock_path.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _precheck_mining_lock() -> str | None:
+    """启动前预检挖掘锁。返回 None = 可启动; 返回 str = 冲突原因 (给失败页)。
+
+    app.main 的 lifespan 第一件事就是抢 data_dir/.mining_process_lock,
+    被别的后端实例 (panel 模式、隧道后端或残留进程) 占住时 lifespan 直接
+    抛 MiningProcessLockError, uvicorn 吞掉后主线程只能等满 150s 报笼统的
+    "超时"。这里用同一把锁试抢一下, 提前把冲突翻译成用户可操作的指引。
+    试抢成功立即释放, 真正的持有仍由 lifespan 负责。
+    """
+    from app.config import settings
+    from app.services.mining_process_lock import (
+        MiningProcessLock,
+        MiningProcessLockError,
+    )
+
+    lock = MiningProcessLock(settings.data_dir)
+    try:
+        lock.acquire()
+    except MiningProcessLockError:
+        return (
+            "检测到另一个后端实例正在占用数据目录\n"
+            "(panel 模式、云隧道或残留进程)\n"
+            "请先停止它再打开桌面版\uff1a\n"
+            "1. 运行 .\\panel.cmd stop\n"
+            "2. 或在任务管理器结束残留的 python / uvicorn 进程\n"
+            "完成后重新打开本应用"
+        )
+    lock.release()
+    return None
 
 
 def _guard_streams() -> None:
@@ -239,8 +280,13 @@ def _find_free_port(start: int, count: int = _PORT_PROBE_RANGE) -> int:
     return start
 
 
-def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
-    """后台线程: 启动 uvicorn 服务。ready_event 在线程退出时置位 (通知主线程)。"""
+def _run_uvmicorn(
+    port: int, ready_event: threading.Event, failure: list[str]
+) -> None:
+    """后台线程: 启动 uvicorn 服务。ready_event 在线程退出时置位 (通知主线程)。
+
+    failure 为共享容器: 线程内捕获到异常时写入摘要, 供失败页显示真因而非超时。
+    """
     import uvicorn
 
     try:
@@ -250,6 +296,7 @@ def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
         from app.main import app
     except Exception:
         logger.exception("后端模块导入失败 (app.main 或其依赖)")
+        failure.append("后端模块导入失败\uff0c详情见 data\\desktop.log")
         ready_event.set()
         return
 
@@ -263,11 +310,6 @@ def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
     )
     server = uvicorn.Server(config)
 
-    # 线程结束时通知主线程 (无论正常退出还是异常)
-    def _signal_done(*exc):
-        ready_event.set()
-    server.config.callback_notify = None  # 不用 notify 机制
-
     try:
         server.run()
     except Exception:
@@ -275,14 +317,21 @@ def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
         # 不捕获则线程静默死亡, 主线程 _wait_for_server 傻等满 60s 后报「超时」,
         # 真正的崩溃原因 (如某个原生库加载失败 / 缺 hidden import) 永远看不到。
         logger.exception("uvicorn 后端启动/运行失败")
+        failure.append("uvicorn 后端启动失败\uff0c详情见 data\\desktop.log")
     finally:
         ready_event.set()
 
 
-def _wait_for_server(port: int, timeout: float = 60.0) -> bool:
+def _wait_for_server(
+    port: int, timeout: float = 60.0, done_event: threading.Event | None = None
+) -> bool:
     """轮询 health 接口直到后端就绪或超时。
 
     比 monkey-patch uvicorn 内部方法更健壮, 不依赖版本内部实现。
+
+    done_event 置位表示后端线程已退出 (lifespan 失败被 uvicorn 吞掉时不向
+    调用方抛异常, 只表现为 server.run() 正常返回) —— 此时不可能出现就绪,
+    立即返回 False, 不再傻等满 timeout 把「启动失败」伪装成「超时」。
     """
     import urllib.request
     import urllib.error
@@ -290,6 +339,8 @@ def _wait_for_server(port: int, timeout: float = 60.0) -> bool:
     url = f"http://127.0.0.1:{port}/health"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if done_event is not None and done_event.is_set():
+            return False
         try:
             with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200:
@@ -300,17 +351,13 @@ def _wait_for_server(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def _open_window(port: int) -> None:
-    """主线程: 先显示加载页, 后端就绪后自动切到正式界面 (DSA 式加载体验)。
-
-    双击后立即弹窗给出反馈, 消除启动期(行情同步, 冷启动 1-2 分钟)毫无
-    反馈的空窗感; 就绪后 load_url 无缝切换, 不再需要 main 里先等 60s 才开窗。
-    """
+def _create_window(html: str):
+    """按桌面版固定规格建窗口 (加载页与失败页共用)。"""
     import webview  # type: ignore[import-not-found]
 
-    window = webview.create_window(
+    return webview.create_window(
         _APP_NAME,
-        html=_LOADING_HTML,
+        html=html,
         width=1440,
         height=900,
         min_size=(1024, 700),
@@ -318,6 +365,36 @@ def _open_window(port: int) -> None:
         # 桌面版固定单窗口, 禁用外部浏览器跳转
         confirm_close=False,
     )
+
+
+def _open_static_window(html_text: str) -> None:
+    """只弹一个静态内容窗口 (预检失败等场景: 后端根本没起, 无需等待切换)。"""
+    import webview  # type: ignore[import-not-found]
+
+    window = _create_window(html_text)
+
+    def _on_gui_ready() -> None:
+        # 启动器以 SW_HIDE 隐藏控制台, Windows 会把隐藏标志传给进程第一个
+        # 窗口(即本窗口), 故 GUI 循环就绪后显式 show (同 _open_window)
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            window.show()
+
+    webview.start(_on_gui_ready, debug=False)
+
+
+def _open_window(
+    port: int, ready_event: threading.Event, failure: list[str]
+) -> None:
+    """主线程: 先显示加载页, 后端就绪后自动切到正式界面 (DSA 式加载体验)。
+
+    双击后立即弹窗给出反馈, 消除启动期(行情同步, 冷启动 1-2 分钟)毫无
+    反馈的空窗感; 就绪后 load_url 无缝切换, 不再需要 main 里先等 60s 才开窗。
+    """
+    import webview  # type: ignore[import-not-found]
+
+    window = _create_window(_LOADING_HTML)
 
     def _on_gui_ready() -> None:
         # 启动器(scripts\desktop-hidden.vbs)以 SW_HIDE 隐藏控制台, Windows 会把
@@ -327,7 +404,7 @@ def _open_window(port: int) -> None:
         except Exception:
             pass
         # 冷启动含 lifespan 初始化 + 启动期全市场行情同步, 给足 150s
-        if _wait_for_server(port, timeout=150.0):
+        if _wait_for_server(port, timeout=150.0, done_event=ready_event):
             try:
                 window.load_url(f"http://127.0.0.1:{port}")
                 logger.info("加载完成, 已切换到正式界面")
@@ -335,9 +412,16 @@ def _open_window(port: int) -> None:
                 # 窗口在加载完成前被用户关掉: webview.start 已/即将返回, 静默即可
                 logger.info("窗口已关闭, 跳过界面切换")
         else:
-            logger.error("后端启动超时, 窗口停留在失败提示页")
+            # 区分三态给真因: 线程内异常摘要 > 后端提前退出 > 真超时(还在慢启动)
+            if failure:
+                reason = failure[0]
+            elif ready_event.is_set():
+                reason = "后端进程已提前退出\uff0c详情见 data\\desktop.log"
+            else:
+                reason = None
+            logger.error("后端未就绪 (reason=%s), 窗口切换到失败提示页", reason)
             try:
-                window.load_html(_FAILED_HTML)
+                window.load_html(_failed_html(reason))
                 window.show()
             except Exception:
                 pass
@@ -369,21 +453,30 @@ def main() -> int:
     if not _acquire_single_instance():
         return 0
 
+    # 挖掘锁预检: 被其他后端实例占住时 lifespan 必败, 提前秒显失败页并给出
+    # 操作指引, 而不是让用户对着 150s 后的笼统"超时"猜 (见 _precheck_mining_lock)
+    conflict = _precheck_mining_lock()
+    if conflict is not None:
+        logger.error("启动预检: %s", conflict.replace("\n", " "))
+        _open_static_window(_failed_html(conflict))
+        return 1
+
     try:
         port = _find_free_port(_BASE_PORT)
         logger.info("桌面版后端将监听 127.0.0.1:%d", port)
 
         # 后台线程起 uvicorn
         ready = threading.Event()
+        failure: list[str] = []
         server_thread = threading.Thread(
-            target=_run_uvmicorn, args=(port, ready), daemon=True,
+            target=_run_uvmicorn, args=(port, ready, failure), daemon=True,
             name="uvicorn",
         )
         server_thread.start()
 
         # 立即弹加载窗口 (DSA 式: 双击马上有反馈), 后端就绪后窗口自动
         # 切到正式界面; 超时则窗口内显示失败提示, 不再让主流程先干等 60s
-        _open_window(port)
+        _open_window(port, ready, failure)
 
         # 窗口关闭后, 进程退出 (daemon 线程会被回收)
         logger.info("窗口已关闭, 桌面版退出")
