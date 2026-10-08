@@ -1,8 +1,8 @@
 /**
  * 板块切换卡片 (盘中轮动) — 概念/行业分析页共用。
  *
- * 数据: GET /api/sector-rotation (全量分钟聚合, 概念/行业二选一由页面 kind 决定),
- * 30s 前端轮询实时刷新 (分钟数据后端 6s 增量落盘, 30s 粒度已足够盘中观察)。
+ * 数据: GET /api/sector-rotation (今日快照优先，无有效快照回放分钟历史),
+ * 盘中 10s 前端轮询，快照显示实际日期与采样开始，概念/行业由 kind 决定。
  * 展示板块来源: 自动榜 (维度可选: 活跃度=近 30 分钟成交额合计 / 综合分 / 现涨幅 /
  * 切入=1h 排名跃升 / 资金流; 行数 5/10/15/20; 自动剔除属性板块黑名单与超成员数
  * 上限的大桶, 名单可编辑, localStorage 按 kind 持久化) 或自定义监控清单
@@ -166,7 +166,7 @@ function pctClass(value: number | null | undefined): string {
 }
 
 const NO_DATA_HINTS: Record<string, string> = {
-  minute_missing: '尚无全市场分钟数据 — 需开启全量分钟落盘 (数据源设置 → 全量分钟路由)',
+  minute_missing: '尚无今日行情快照或分钟历史 — 请开启实时行情并等待成功采样',
   minute_schema: '分钟数据分区读取失败, 请检查数据目录',
   minute_empty: '当日分钟数据为空',
   members_missing: '板块成分数据缺失 — 请先在数据页获取概念/行业分类扩展数据',
@@ -249,8 +249,8 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
       sortBy: rowsMode === 'custom' ? undefined : rowsMode,
     }),
     // 非连续竞价时段 (回放日期/盘前/盘后) 轮动矩阵不变, 降为 5 分钟兜底;
-    // 开盘后间隔函数随下次调度自动回到 30s (phase 计算与 isMarketSessionNow 同源)
-    refetchInterval: () => (isMarketSessionNow() ? 30_000 : 300_000),
+    // 开盘后间隔函数随下次调度自动回到 10s (phase 计算与 isMarketSessionNow 同源)
+    refetchInterval: () => (isMarketSessionNow() ? 10_000 : 300_000),
     staleTime: 25_000,
   })
   const data = rotationQuery.data
@@ -383,7 +383,8 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
         name,
         type: 'line' as const,
         smooth: true,
-        symbol: 'none',
+        symbol: buckets.length === 1 ? 'circle' : 'none',
+        symbolSize: 4,
         data: (heatSeries.matrix[i] ?? []).slice(startCol),
         lineStyle: { color: TREND_COLORS[i % TREND_COLORS.length], width: 1.4 },
         connectNulls: true,
@@ -599,13 +600,13 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
       ],
       series: [
         {
-          name: '切换强度', type: 'line', smooth: true, symbol: 'none',
+          name: '切换强度', type: 'line', smooth: true, symbol: cols === 1 ? 'circle' : 'none', symbolSize: 4,
           data: intensityData,
           lineStyle: { color: '#f59e0b', width: 1.6 },
           areaStyle: { color: 'rgba(245,158,11,0.12)' },
         },
         {
-          name: '全市场', type: 'line', smooth: true, symbol: 'none', yAxisIndex: 1,
+          name: '全市场', type: 'line', smooth: true, symbol: cols === 1 ? 'circle' : 'none', symbolSize: 4, yAxisIndex: 1,
           data: timeline.slice(startCol).map(point => point.market_pct),
           lineStyle: { color: 'rgba(128,140,160,0.55)', width: 1, type: 'dashed' },
         },
@@ -710,7 +711,7 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
           )
         )}
         <span className="text-[10px] text-muted">
-          {data?.status === 'ok' && latest ? `${data.date} ${data.as_of} · 切换强度 ${latest.rotation.toFixed(2)} · 领涨 ${latest.leader}` : '全量分钟聚合'}
+          {data?.status === 'ok' && latest ? `${data.source === 'quote_snapshot' ? `快照采样 · ${data.sample_started_at} 起 · ` : '分钟历史 · '}${data.date} ${data.as_of} · 切换强度 ${latest.rotation.toFixed(2)} · 领涨 ${latest.leader}` : '行情快照 / 分钟聚合'}
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           <span className="text-[9px] text-muted">显示</span>
@@ -796,7 +797,7 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
       </div>
 
       {rotationQuery.isLoading ? (
-        <div className="flex h-36 items-center justify-center text-xs text-muted">正在聚合全市场分钟数据…</div>
+        <div className="flex h-36 items-center justify-center text-xs text-muted">正在聚合板块行情…</div>
       ) : rotationQuery.isError ? (
         <div className="flex h-36 items-center justify-center text-xs text-danger">
           板块切换数据加载失败 · {String((rotationQuery.error as Error)?.message || rotationQuery.error)}
@@ -906,7 +907,7 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
                       })}
                     {!(data.universe ?? []).length && <div className="p-2 text-center text-[10px] text-muted">板块清单不可用</div>}
                   </div>
-                  <div className="px-1 pt-1 text-[9px] text-muted/70">右列为 活跃度 (近 30 分钟成交额合计) · 现涨幅</div>
+                  <div className="px-1 pt-1 text-[9px] text-muted/70">{data.source === 'quote_snapshot' ? '快照不提供成交额活跃度 · 右列为现涨幅' : '右列为 活跃度 (近 30 分钟成交额合计) · 现涨幅'}</div>
                 </div>
               )}
             </div>
@@ -918,7 +919,7 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
               // 复用节点换挂 ref, 造成两个 echarts 实例交叉挤占同一个 dom
               <div key="heatmap" className="rounded-lg border border-border/60 bg-elevated/30 p-1.5">
                 <div className="px-1 pb-1 text-[9px] text-muted">
-                  热度板块 × 分钟轮动热力图 — 行按{rowsMode === 'custom' ? '自定义清单' : `${SOURCE_LABELS[rowsMode]}维度`}排序, 色为该桶板块涨幅 (红涨绿跌, 平淡近透明), 悬停与下方榜单联动
+                  热度板块 × 轮动热力图 — 行按{rowsMode === 'custom' ? '自定义清单' : `${SOURCE_LABELS[rowsMode]}维度`}排序, 色为该桶板块涨幅 (红涨绿跌, 平淡近透明), 悬停与下方榜单联动
                 </div>
                 <div ref={heat.ref} style={{ height: heatHeight }} className="w-full" />
               </div>
@@ -1038,12 +1039,13 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
           </div>
           <div className="mt-1.5 flex items-center gap-1.5 text-[9px] text-muted">
             <Database className="h-3 w-3" />
-            {`${data.member_count} 个${dimLabel} · ${data.bucket_minutes}分钟桶 · 基准 ${data.basis === 'prev_close' ? '昨收' : data.basis === 'first_close' ? '今开' : '混合'}`}
+            {data.source === 'quote_snapshot' && '快照采样 · 成交额活跃度不可用，活跃榜按综合评分排序 · '}
+            {`${data.member_count} 个${dimLabel} · ${data.bucket_minutes}分钟桶 · 基准 ${data.basis === 'quote_prev_close' || data.basis === 'prev_close' ? '昨收' : data.basis === 'first_close' ? '今开' : '混合'}`}
             {data.flow_available ? ` · 资金流 ${data.flow_field}` : ' · 未启用资金流'}
             <span className="ml-auto">
               {rowsMode === 'custom'
                 ? `自定义监控 ${customNames.length} 个`
-                : `${SOURCE_LABELS[rowsMode]}前 ${displayNames.length}${rowsMode === 'activity' ? ' (近 30 分钟成交额)' : rowsMode === 'momentum' ? ' (走强→走弱)' : ''}`} · 每 30s 自动刷新 · 排名变化 ↑切入 ↓退潮 (相对 1 小时前)
+                : `${rowsMode === 'activity' && data.source === 'quote_snapshot' ? '综合评分' : SOURCE_LABELS[rowsMode]}前 ${displayNames.length}${rowsMode === 'activity' && data.source !== 'quote_snapshot' ? ' (近 30 分钟成交额)' : rowsMode === 'momentum' ? ' (走强→走弱)' : ''}`} · 盘中每 10s 自动刷新 · 排名变化 ↑切入 ↓退潮 (相对 1 小时前)
             </span>
           </div>
         </>

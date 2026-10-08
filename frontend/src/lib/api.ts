@@ -2141,6 +2141,8 @@ export interface SectorRotationSector {
 }
 
 export interface SectorRotation {
+  source?: 'quote_snapshot' | 'minute_history'
+  sample_started_at?: string | null
   status: 'ok' | 'no_data' | 'empty'
   reason?: string
   date?: string

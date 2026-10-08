@@ -1,4 +1,7 @@
-"""盘中板块切换监控 — 基于全量分钟数据的实时轮动走势。
+"""盘中板块切换监控 — 今日行情快照优先，缺失时回放分钟历史。
+
+快照由 quote_service 标准股票行情异步采样到独立 rotation_snapshots，
+使用行情小数制涨跌幅，不生成 OHLC；当前分钟内存更新触发 generation 缓存失效。
 
 数据来源 (零新增数据源, 全部复用现有资产):
   - 全市场当日分钟K: data/kline_minute/date=X/part.parquet (全量分钟能力落盘,
@@ -27,6 +30,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -34,6 +38,7 @@ from typing import Any
 import polars as pl
 
 from app.market_time import trading_minutes_elapsed_from_dt
+from app.services import rotation_snapshots
 from app.services.ext_data import ExtConfigStore
 from app.services.rps_rotation import _load_concept_map_df
 
@@ -42,6 +47,7 @@ logger = logging.getLogger(__name__)
 _CACHE_TTL = 30.0
 _cache: dict[tuple, dict] = {}
 _cache_ts: dict[tuple, float] = {}
+_cache_lock = threading.RLock()
 
 # 与 api/ext_data dimension-intraday 一致: 允许的分钟桶粒度
 _ALLOWED_BUCKETS = (1, 5, 15)
@@ -79,8 +85,9 @@ _CACHE_MAX_ENTRIES = 32
 
 def invalidate_cache() -> None:
     """清空板块切换结果缓存 (数据管道完成后调用, 避免返回旧数据)。"""
-    _cache.clear()
-    _cache_ts.clear()
+    with _cache_lock:
+        _cache.clear()
+        _cache_ts.clear()
 
 
 def _bare(col: str = "symbol") -> pl.Expr:
@@ -383,29 +390,37 @@ def build_sector_rotation(
 
     data_dir: Path = repo.store.data_dir
     cache_key = (
+        str(data_dir.resolve()), rotation_snapshots.version(data_dir),
         kind, flow_field or "", top, bucket_minutes, tuple(series_names or ()),
         exclude_effective, rows_limit, sort_by,
     )
     now = time.monotonic()
-    hit = _cache.get(cache_key)
-    if hit is not None and (now - _cache_ts.get(cache_key, 0.0)) < _CACHE_TTL:
-        return hit
+    with _cache_lock:
+        hit = _cache.get(cache_key)
+        if hit is not None and (now - _cache_ts.get(cache_key, 0.0)) < _CACHE_TTL:
+            return hit
 
     result = _compute(repo, data_dir, kind, flow_field, top, bucket_minutes, series_names, exclude_effective, rows_limit, sort_by)
-    _cache[cache_key] = result
-    _cache_ts[cache_key] = time.monotonic()
-    while len(_cache) > _CACHE_MAX_ENTRIES:
-        oldest = min(_cache_ts, key=lambda k: _cache_ts.get(k, 0.0), default=None)
-        if oldest is None or oldest == cache_key:
-            break
-        _cache.pop(oldest, None)
-        _cache_ts.pop(oldest, None)
+    with _cache_lock:
+        _cache[cache_key] = result
+        _cache_ts[cache_key] = time.monotonic()
+        while len(_cache) > _CACHE_MAX_ENTRIES:
+            oldest = min(_cache_ts, key=lambda k: _cache_ts.get(k, 0.0), default=None)
+            if oldest is None or oldest == cache_key:
+                break
+            _cache.pop(oldest, None)
+            _cache_ts.pop(oldest, None)
     return result
 
 
 def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, bucket_minutes: int, series_names: list[str] | None, exclude_sectors: tuple[str, ...], auto_rows: int, sort_by: str) -> dict:
     minute_dir = data_dir / "kline_minute"
     target = _latest_minute_partition(minute_dir)
+    samples = rotation_snapshots.read_today(data_dir)
+    source = "minute_history"
+    if samples is not None:
+        target = rotation_snapshots.version(data_dir)[0]
+        source = "quote_snapshot"
     if not target:
         return {"status": "no_data", "reason": "minute_missing", "kind": kind}
 
@@ -413,7 +428,11 @@ def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, 
     if map_df.is_empty() or member_count == 0:
         return {"status": "no_data", "reason": "members_missing", "date": target, "kind": kind}
 
-    pcts, basis, has_amount = _minute_pcts(minute_dir, target)
+    if source == "quote_snapshot":
+        pcts = samples.with_columns(_bare().alias("_bare"))
+        basis, has_amount = "quote_prev_close", False
+    else:
+        pcts, basis, has_amount = _minute_pcts(minute_dir, target)
     if pcts is None:
         return {"status": "no_data", "reason": basis, "date": target, "kind": kind}
 
@@ -628,6 +647,8 @@ def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, 
 
     return {
         "status": "ok",
+        "source": source,
+        "sample_started_at": samples['datetime'].min().strftime('%H:%M') if source == 'quote_snapshot' else None,
         "date": target,
         "kind": kind,
         "basis": basis,

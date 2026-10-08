@@ -615,3 +615,77 @@ def test_rank_reference_counts_trading_minutes_across_lunch(tmp_path):
     assert a["pct_prev"] == pytest.approx(0.02, abs=1e-4)
     assert b["rank_prev"] == 2 and b["rank_change"] == 1
     assert a["rank_prev"] == 1 and a["rank_change"] == -1
+
+
+def test_live_snapshot_cache_restart_and_rollover(repo, monkeypatch):
+    from app.market_time import CN_TZ
+    from app.services import rotation_snapshots as snapshots
+    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
+    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
+    records = [{"symbol": symbol, "last_price": 110., "prev_close": 100.,
+                "timestamp": now.timestamp() * 1000} for symbol in SYMS_A + SYMS_B]
+    snapshots.capture(repo.store.data_dir, records, now)
+    result = sector_rotation.build_sector_rotation(repo)
+    assert result["source"] == "quote_snapshot"
+    assert result["date"] == "2026-10-08"
+    assert result["sample_started_at"] == "14:20"
+    assert result["sectors"][0]["pct_now"] == pytest.approx(.1)
+    records[0]["last_price"] = 120.
+    snapshots.capture(repo.store.data_dir, records, now)
+    assert sector_rotation.build_sector_rotation(repo)["sectors"][0]["pct_now"] == pytest.approx(.15)
+    snapshots._pending.join()
+    with snapshots._lock:
+        snapshots._latest.pop(repo.store.data_dir.resolve())
+    sector_rotation.invalidate_cache()
+    assert sector_rotation.build_sector_rotation(repo)["source"] == "quote_snapshot"
+    tomorrow = datetime(2026, 10, 9, 9, 40, tzinfo=CN_TZ)
+    monkeypatch.setattr(snapshots, "cn_now", lambda: tomorrow)
+    assert sector_rotation.build_sector_rotation(repo)["date"] == DAY
+    snapshots.capture(repo.store.data_dir, records, tomorrow)
+    assert snapshots.read_today(repo.store.data_dir) is None
+
+
+def test_snapshot_empty_invalid_and_corrupt_fall_back(repo, monkeypatch):
+    from app.market_time import CN_TZ
+    from app.services import rotation_snapshots as snapshots
+    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
+    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
+    snapshots.capture(repo.store.data_dir, [], now)
+    snapshots.capture(repo.store.data_dir, [{"symbol": SYMS_A[0], "last_price": float("nan"),
+                                           "change_pct": .1}], now)
+    directory = repo.store.data_dir / "rotation_snapshots" / "date=2026-10-08"
+    directory.mkdir(parents=True)
+    (directory / "1420.parquet").write_bytes(b"bad")
+    assert sector_rotation.build_sector_rotation(repo)["source"] == "minute_history"
+    assert sector_rotation.build_sector_rotation(repo)["date"] == DAY
+
+
+@pytest.mark.parametrize("offset", [-121, 121])
+def test_snapshot_rejects_stale_or_future_quote(repo, monkeypatch, offset):
+    from datetime import timedelta
+
+    from app.market_time import CN_TZ
+    from app.services import rotation_snapshots as snapshots
+    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
+    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
+    snapshots.capture(repo.store.data_dir, [{"symbol": SYMS_A[0], "last_price": 110.,
+        "prev_close": 100., "timestamp": (now + timedelta(seconds=offset)).timestamp()*1000}], now)
+    assert snapshots.read_today(repo.store.data_dir) is None
+    assert sector_rotation.build_sector_rotation(repo)["date"] == DAY
+
+
+def test_snapshot_accepts_reasonable_source_clock_skew(repo, monkeypatch):
+    from datetime import timedelta
+
+    from app.market_time import CN_TZ
+    from app.services import rotation_snapshots as snapshots
+
+    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
+    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
+    snapshots.capture(repo.store.data_dir, [{"symbol": SYMS_A[0], "last_price": 110.,
+        "prev_close": 100., "timestamp": (now + timedelta(seconds=60)).timestamp()*1000}], now)
+    result = sector_rotation.build_sector_rotation(repo)
+    assert result["source"] == "quote_snapshot"
+    assert result["date"] == "2026-10-08"
+    assert result["sectors"][0]["pct_now"] == pytest.approx(.1)
+    snapshots._pending.join()

@@ -877,6 +877,14 @@ class QuoteService:
             if r.get("symbol") not in all_index_symbols and r.get("symbol") not in all_etf_symbols
         ]
 
+        if self._repo and stock_records:
+            try:
+                from app.services.rotation_snapshots import capture
+
+                capture(self._repo.store.data_dir, stock_records)
+            except Exception:  # noqa: BLE001 — optional sampler must not break quotes
+                logger.warning("板块轮动快照采样失败", exc_info=True)
+
         fetch_ms = (time.perf_counter() - t0) * 1000
         fetched_at = time.time() * 1000
 
