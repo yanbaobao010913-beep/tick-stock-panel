@@ -161,7 +161,7 @@ function loadNewAccountDefaults(): Required<NewAccountDefaults> {
   let saved: NewAccountDefaults = {}
   try { saved = JSON.parse(localStorage.getItem(NEW_ACCOUNT_DEFAULTS_KEY) || '{}') } catch { /* 忽略坏数据 */ }
   return {
-    cash: saved.cash ?? '1000000',
+    cash: saved.cash ?? '100000',
     commissionWan: saved.commissionWan ?? '2.5',   // 万2.5
     stampQian: saved.stampQian ?? '1',             // 千1 (仅卖出)
     slippageBps: saved.slippageBps ?? '5',         // 5bps
@@ -223,7 +223,7 @@ function SetupCard({ accId, onDone, onCancel }: { accId: string; onDone: (create
         value={cash}
         onChange={e => setCash(e.target.value)}
         className="mt-1 w-full rounded-btn border border-border bg-base px-3 py-2 font-mono text-sm outline-none focus:border-accent/50"
-        placeholder="1000000"
+        placeholder="100000"
       />
       <div className="mt-3 grid grid-cols-3 gap-2">
         <div>
