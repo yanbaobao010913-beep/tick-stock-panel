@@ -16,6 +16,7 @@ monkeypatch 注入 dsa_bridge.DSA_DB_PATH, 绝不碰真实旧库 (autouse fixtur
 """
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -1090,6 +1091,26 @@ def test_premarket_bridge_fail_detail(data_dir, monkeypatch):
     bridge = next(c for c in checks if c["name"] == "DSA桥可用")
     assert bridge["status"] == "fail"
     assert "旧库不可用" in bridge["detail"] and "空仓" in bridge["detail"]
+
+
+def test_premarket_bridge_unused_when_portfolio_supplies(data_dir, monkeypatch):
+    """本账供仓 → 旧桥不参与持仓, 不探旧库也不报异常 (云端容器无 DSA 部署的常态)。"""
+    monkeypatch.setattr(dsa_watch, "is_trading_day", lambda now=None: True)
+    monkeypatch.setattr(dsa_bridge, "DSA_DB_PATH", data_dir / "no-such.db")
+    _seed_watchlist(["600460.SH"])
+    trade = {"id": "t1", "symbol": "600460.SH", "side": "buy", "quantity": 100.0,
+             "price": 31.5, "fee": None, "traded_at": "2026-08-25T09:30:00", "note": None}
+    path = data_dir / "user_data" / "dsa_portfolio" / "trades.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(trade, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _never_probe():
+        raise AssertionError("本账供仓时不应再开旧库")
+
+    monkeypatch.setattr(dsa_watch, "_fetch_position_rows", _never_probe)
+    checks = dsa_watch.run_premarket_checks(data_dir, WatchStubRepo())
+    bridge = next(c for c in checks if c["name"] == "DSA桥可用")
+    assert bridge["status"] == "ok" and "本账" in bridge["detail"]
 
 
 def test_premarket_stale_rules_warn(data_dir, legacy_db, monkeypatch):
