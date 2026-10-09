@@ -1084,18 +1084,24 @@ def run_premarket_checks(data_dir: Path, repo) -> list[dict]:
     except Exception as e:
         symbols, watchlist_error = [], str(e)
     try:
-        raw_rows = _fetch_position_rows()
-        bridge_positions = merge_position_rows(
-            [r for r in (_clean_position_row(row) for row in raw_rows) if r is not None],
-        )
-        bridge_error = None
+        # "持仓不在自选"提示按实际持仓来源 (§4.4.3 本账优先); 两源皆不可用时按空仓不阻塞
+        positions, positions_source = load_positions()
+        positions_error = None
     except BridgeUnavailableError as e:
-        raw_rows, bridge_positions, bridge_error = [], {}, str(e)
-    try:
-        # "持仓不在自选"提示按实际持仓来源 (§4.4.3 本账优先); 失败按空仓不阻塞
-        positions, _positions_source = load_positions()
-    except BridgeUnavailableError:
-        positions = {}
+        positions, positions_source, positions_error = {}, "unavailable", str(e)
+    if positions_error is not None or positions_source == "dsa_portfolio":
+        # 本账供仓 / 持仓已确定失败时都不再探旧库: 无 DSA 部署的实例 (云端容器)
+        # 那个 Windows 路径必然不存在, 探一次只会把正常状态报成异常
+        raw_rows, bridge_positions, bridge_error = [], {}, None
+    else:
+        try:
+            raw_rows = _fetch_position_rows()
+            bridge_positions = merge_position_rows(
+                [r for r in (_clean_position_row(row) for row in raw_rows) if r is not None],
+            )
+            bridge_error = None
+        except BridgeUnavailableError as e:
+            raw_rows, bridge_positions, bridge_error = [], {}, str(e)
 
     def _safe(name: str, fn) -> None:
         try:
@@ -1113,7 +1119,17 @@ def run_premarket_checks(data_dir: Path, repo) -> list[dict]:
         _safe("数据源", lambda: _check_data_source(repo, symbols))
         _safe("自选K线覆盖", lambda: _check_kline_coverage(repo, symbols))
     _safe("同步规则启用", lambda: _check_sync_rules(data_dir, repo, positions))
-    if bridge_error is not None:
+    if positions_error is not None:
+        checks.append({
+            "name": "DSA桥可用", "status": "fail",
+            "detail": f"持仓无法确定, 按空仓处理 ({positions_error})"[:_MAX_DETAIL_LEN],
+        })
+    elif positions_source == "dsa_portfolio":
+        checks.append({
+            "name": "DSA桥可用", "status": "ok",
+            "detail": f"持仓走本账 {len(positions)} 只, 旧桥未参与",
+        })
+    elif bridge_error is not None:
         checks.append({
             "name": "DSA桥可用", "status": "fail",
             "detail": f"旧库不可用, 持仓按空仓处理 ({bridge_error})"[:_MAX_DETAIL_LEN],
