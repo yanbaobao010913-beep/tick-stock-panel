@@ -540,7 +540,7 @@ def parse_dsa_rule(rule: dict) -> _ParsedRule | None:
 
 
 def _content_differs(rule: dict, expected: ExpectedRule) -> bool:
-    """现存规则内容与期望是否不一致 (op/price/severity/message; enabled 不参与比较)。"""
+    """现存规则内容与期望是否不一致 (op/price/severity/message/price_path; enabled 不参与比较)。"""
     conds = rule.get("conditions")
     first = conds[0] if isinstance(conds, list) and conds and isinstance(conds[0], dict) else {}
     price = first.get("value")
@@ -550,6 +550,8 @@ def _content_differs(rule: dict, expected: ExpectedRule) -> bool:
         or abs(float(price) - expected.price) > 1e-9
         or rule.get("severity") != expected.severity
         or rule.get("message") != _rule_message(expected)
+        or rule.get("price_path") is not True  # 老版本同步的规则补启用价格路径模式
+        or rule.get("path_kind") != expected.kind
     )
 
 
@@ -632,6 +634,11 @@ def _build_rule(spec: ExpectedSpec, expected: ExpectedRule) -> dict:
         "logic": "and",
         "enabled": True,
         "message": _rule_message(expected),
+        # 价格路径模式: 托管规则显式启用穿越/收复/低位反弹状态机 (app/strategy/
+        # price_path.py), 替代 86400 冷却的"整天只响一次"。path_kind 供同 kind
+        # 事件合并 (接近/逼近/到价) 与买点风险文案。
+        "price_path": True,
+        "path_kind": expected.kind,
     }
     return monitor_rules.normalize(rule)
 
@@ -810,8 +817,10 @@ def run_reconcile(data_dir: Path | None, repo, engine=None) -> dict:
         for cur, er in diff.updates:
             rule = dict(cur)
             rule["conditions"] = [{"field": "close", "op": er.op, "value": er.price}]
-            rule["severity"] = er.severity  # enabled/created_at/name/symbols 等全保留
+            rule["severity"] = er.severity  # enabled/created_at/name/symbols/webhook 渠道等全保留
             rule["message"] = _rule_message(er)
+            rule["price_path"] = True   # 补启价格路径模式 (老版本同步的规则)
+            rule["path_kind"] = er.kind
             try:
                 monitor_rules.validate(rule)
             except ValueError as e:

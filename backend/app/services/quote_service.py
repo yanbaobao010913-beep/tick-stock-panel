@@ -1306,6 +1306,13 @@ class QuoteService:
                         except Exception as e:  # noqa: BLE001
                             logger.warning("指数监控评估失败 (不影响股票/ETF 告警): %s", e)
                     if rule_events:
+                        # 价格路径事件合并 (统一出口: 记录/SSE/语音/Webhook 之前):
+                        # 同 symbol 同 kind 的 接近/逼近/到价 合并成最强一条, 不同 kind
+                        # (止损/加仓) 互不吞并; 非 path 事件原样透传。合并后单事件
+                        # 最多触发一单, 不会出现同轮连下三单。
+                        from app.strategy.price_path import merge_round_events
+
+                        rule_events = merge_round_events(rule_events)
                         rule_events = self._format_extension_notifications(rule_events)
                         # 落盘到 alerts.jsonl
                         try:
@@ -1339,7 +1346,8 @@ class QuoteService:
                                 "total_count", "up_count", "down_count", "leader",
                                 "abnormal_window", "abnormal_value", "abnormal_threshold",
                                 "abnormal_closeness", "volume_delta", "volume_delta_span",
-                                "volume_delta_amount",
+                                "volume_delta_amount", "path_kind", "info_only",
+                                "path_low", "merged_count",
                             ):
                                 if key in ev:
                                     alert[key] = ev[key]

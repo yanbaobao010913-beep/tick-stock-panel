@@ -1015,6 +1015,9 @@ export interface MonitorRule {
   remind_date?: string | null   // YYYY-MM-DD
   lead_days?: number            // 提前 N 天进入提醒窗口
   lot_id?: string               // 由「持仓提醒」页生成的规则, 托管在批次页 (监控中心只读)
+  // 价格路径模式 (默认关闭, DSA 对账托管规则启用): 穿越/收复/低位反弹状态机
+  price_path?: boolean
+  path_kind?: string | null     // 托管 kind 标注 (如 stop_loss / near_stop_loss)
 }
 
 // 批次登记 (薄批次, 页面名"持仓提醒") — 只作监控规则生成的载体, 不做任何会计

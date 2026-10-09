@@ -165,6 +165,10 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
 
     触发条件: 事件带 symbol 与价格、有规则匹配、未冷却; 下单复用 paper.create_order
     (冻结/资金/T+1/涨跌停等校验自动生效), ref_price 用事件价格 (当前快照价)。
+
+    信息事件防御 (在下单入口, 不只靠文案): 价格路径模式的收复/回落/低位反弹事件
+    带 info_only=True, 属观察提示而非交易指令, 此处直接跳过 — 即使事件带 rule_id/
+    symbol/price 也不得触发自动跟单 (防止反弹/收复提示连环下单)。
     """
     created: list[dict] = []
     if not events:
@@ -174,6 +178,8 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
         return created
     with paper.PAPER_LOCK:
         for ev in events:
+            if ev.get("info_only") or ev.get("type") in {"price_path_recovery", "price_path_bounce"}:
+                continue
             symbol = (ev.get("symbol") or "").strip()
             price = ev.get("price")
             if not symbol or price is None or price <= 0:
