@@ -4066,11 +4066,6 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  // ===== 二开扩展: DSA 桥接探针 =====
-  dsaBridgeHealth: () =>
-    request<{ status: string; dsa_db_found: boolean; analysis_history_count: number | null }>(
-      '/api/ext/dsa/health',
-    ),
 }
 
 // ===== Pipeline =====
