@@ -23,6 +23,7 @@ import polars as pl
 
 from app.market_time import cn_today
 from app.strategy import config as _strategy_config
+from app.strategy import price_path as _price_path
 from app.strategy.custom_signals import _OP_BUILDERS  # type: ignore  # 复用运算符构造器
 from app.strategy.custom_signals import signal_names as _custom_signal_names
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
@@ -373,6 +374,8 @@ class MonitorRuleEngine:
         # abnormal 规则边缘触发状态: (rule_id, symbol) → 上一轮是否已达阈值。
         # 只在 False → True 跳变时告警 (首轮观测不触发, 防止新建规则瞬间刷屏)。
         self._abnormal_condition_state: dict[tuple[str, str], bool] = {}
+        # 价格路径状态机 (price_path=True 的规则): 穿越/收复/低位反弹 + 当日持久化
+        self._price_path = _price_path.PricePathTracker()
 
     def set_strategy_engine(self, engine) -> None:
         """注入 StrategyEngine, type=strategy 规则据此跑选股。"""
@@ -381,6 +384,7 @@ class MonitorRuleEngine:
     def set_data_dir(self, data_dir) -> None:
         """注入数据目录, 用于加载策略的用户覆盖配置。"""
         self._data_dir = data_dir
+        self._price_path.set_data_dir(data_dir)
 
     def _signal_label(self, field: str) -> str:
         """信号/字段 → 中文名: 内置查 _SIGNAL_CN; 自定义 csg_/csgi_ 查用户命名。
@@ -506,14 +510,16 @@ class MonitorRuleEngine:
             for key, value in list(self._abnormal_condition_state.items())
             if key[0] in active_ids
         }
+        self._price_path.sync_rules(self._rules)
         logger.info("MonitorRuleEngine: 装载 %d 条规则", len(self._rules))
         self._rules_version += 1
 
     def add_rule(self, rule: dict) -> None:
-        if rule.get("enabled") is not False:
-            self._rules[rule["id"]] = rule
-        else:
+        if rule.get("enabled") is False:
             self._rules.pop(rule["id"], None)
+        else:
+            self._rules[rule["id"]] = rule
+        self._price_path.sync_rules(self._rules)
         self._rules_version += 1
 
     def remove_rule(self, rule_id: str) -> None:
@@ -531,6 +537,7 @@ class MonitorRuleEngine:
         self._sector_condition_state = {
             k: v for k, v in self._sector_condition_state.items() if k[0] != rule_id
         }
+        self._price_path.sync_rules(self._rules)
         self._rules_version += 1
 
     def clear(self) -> None:
@@ -540,6 +547,7 @@ class MonitorRuleEngine:
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
         self._sector_condition_state.clear()
+        self._price_path.sync_rules(self._rules)
         self._rules_version += 1
 
     @property
@@ -612,11 +620,17 @@ class MonitorRuleEngine:
         Returns:
             触发的 AlertEvent dict 列表 (含 ts/rule_id/source/type/symbol/...)
         """
-        if not self._rules or df.is_empty():
+        if not self._rules:
+            return []
+        if df.is_empty():
+            self._price_path.interrupt_asset(asset_type)
+            self._price_path.flush()
             return []
 
         now = time.time()
         events: list[dict] = []
+        # 价格路径轮开始: 跨日重置 + 清本轮快照 memo (无路径规则时零开销)
+        self._price_path.begin_round()
         # 原子化: reset 轮 (股票轮) 时先把本轮结果写到临时容器, 算完后一次性替换
         # _latest_strategy_results。这样 /cached 并发读取永远拿到完整结果,
         # 不会在「清空 → 逐个回填」窗口里读到空中间态 (曾导致策略页闪烁)。
@@ -717,6 +731,13 @@ class MonitorRuleEngine:
         # 要么拿到本轮完整结果, 不会读到空中间态。
         self._latest_strategy_results = self._building_strategy_results
         self._active_matrix_snapshots.pop(asset_type, None)
+
+        # 价格路径轮收尾: symbol 级低位反弹统一判定 + 状态落盘 (异常不拖垮本轮)
+        try:
+            events.extend(self._price_path.end_round(now, self._name_map))
+            self._price_path.flush()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("price_path 轮收尾失败: %s", e)
 
         return events
 
@@ -1079,6 +1100,15 @@ class MonitorRuleEngine:
 
     def _evaluate_rule(self, df: pl.DataFrame, rule: dict, now: float) -> list[dict]:
         """评估单条规则,返回触发的 events。"""
+        # 价格路径模式: 显式启用的单标的 close 阈值规则走穿越/收复/反弹状态机,
+        # 替代 cooldown 语义 (同区间不重复由状态机保证); 其余规则走原通用路径。
+        if rule.get("price_path"):
+            try:
+                return self._price_path.evaluate_rule(df, rule, now, self._name_map)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("规则评估失败 %s: %s", rule.get("id"), e)
+                return []
+
         # 1. 按 scope 过滤作用域
         scoped = self._apply_scope(df, rule)
         if scoped.is_empty():

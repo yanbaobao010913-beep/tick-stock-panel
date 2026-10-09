@@ -471,7 +471,7 @@ def test_diff_rules_price_tolerance_and_foreign_prefix_rule():
         # 1e-9 容差内的价差不算变更
         {"id": "dsa_600460sh_stop_loss", "name": "DSA·600460·stop_loss", "symbols": ["600460.SH"],
          "conditions": [{"field": "close", "op": "<=", "value": 31.0000000005}], "severity": "critical",
-         "message": "DSA 止损提醒: 收盘价 ≤ 31.00"},
+         "message": "DSA 止损提醒: 收盘价 ≤ 31.00", "price_path": True, "path_kind": "stop_loss"},
         # 外来 DSA· 命名 (kind 段非五类): 不托管不比对不删
         {"id": "foreign_dsa", "name": "DSA·手工·自定义", "symbols": ["600460.SH"],
          "conditions": [{"field": "close", "op": "<=", "value": 1.0}], "severity": "info"},

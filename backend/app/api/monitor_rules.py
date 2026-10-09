@@ -118,6 +118,11 @@ class RuleModel(BaseModel):
     threshold_amount: float = 1e6    # metric=amount 时: 单轮增量 >= 此值(元)时报警
     # 基础过滤 (与策略 basic_filter 语义对齐): 值为 null 表示不过滤
     basic_filter: dict = {}
+    # 价格路径模式: None=客户端未传 (保留现存值, 防止旧表单 PUT 吞掉托管模式);
+    # 显式 True/False 才是设置。生效语义见 app/strategy/price_path.py。
+    price_path: bool | None = None
+    # 托管 kind 标注 (如 stop_loss / near_stop_loss): 供路径事件合并与买点风险文案
+    path_kind: str | None = None
 
 
 # ── 字段选项 ─────────────────────────────────────────────
@@ -300,6 +305,14 @@ def save_rule(req: RuleModel, request: Request):
         raise HTTPException(status_code=409, detail="该规则由「持仓提醒」页托管, 请在持仓提醒页修改")
     if existing and existing.get("created_at"):
         rule["created_at"] = existing["created_at"]
+    # PUT 不吞掉托管的价格路径模式: 客户端未传 (None) 时保留现存值 (旧表单/前端
+    # 不认识该字段时编辑保存不静默关闭); 显式 True/False 才是用户/托管方意图。
+    if existing:
+        if rule.get("price_path") is None:
+            rule["price_path"] = bool(existing.get("price_path"))
+        if rule.get("path_kind") is None and existing.get("path_kind") is not None:
+            rule["path_kind"] = existing["path_kind"]
+    rule["price_path"] = bool(rule.get("price_path"))
     try:
         monitor_rules.validate(rule)
     except ValueError as e:

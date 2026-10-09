@@ -323,6 +323,25 @@ def validate(rule: dict) -> None:
     cd = rule.get("cooldown_seconds", 3600)
     if not isinstance(cd, int) or cd < 0:
         raise ValueError("cooldown_seconds 必须是非负整数")
+    # 价格路径模式 (price_path=True): 仅支持单标的单 close 阈值 (DSA 点位契约)。
+    # 形状不支持时在此明确拒绝, 不退化到错误逻辑。
+    if rule.get("price_path"):
+        conds = rule.get("conditions")
+        first = conds[0] if isinstance(conds, list) and conds and isinstance(conds[0], dict) else {}
+        value = first.get("value")
+        if rule.get("type") != "price":
+            raise ValueError("price_path 价格路径模式仅支持 price 类型规则")
+        if rule.get("asset_type", "stock") not in ("stock", "etf"):
+            raise ValueError("price_path 价格路径模式仅支持股票/ETF")
+        if rule.get("scope") != "symbols" or not isinstance(rule.get("symbols"), list) \
+                or len(rule["symbols"]) != 1 or not rule["symbols"][0]:
+            raise ValueError("price_path 价格路径模式仅支持单标的规则 (scope=symbols)")
+        if len(conds) != 1 or first.get("field") != "close" or first.get("op") not in ("<=", ">=") \
+                or isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value) or value <= 0:
+            raise ValueError("price_path 价格路径模式仅支持单条件 close <= / >= 有限数值阈值")
+        if rule.get("path_kind") is not None and not isinstance(rule.get("path_kind"), str):
+            raise ValueError("path_kind 必须是字符串 (托管 kind 标注)")
 
 
 def normalize(rule: dict) -> dict:
@@ -406,6 +425,10 @@ def normalize(rule: dict) -> dict:
             c for c in r["webhook_channels"] if c in ("feishu", "wecom", "custom", "email")
         ]
     r.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    # 价格路径模式 (默认关闭): True 时走穿越/收复/反弹状态机 (见 app/strategy/price_path.py)。
+    # path_kind 为托管方 (如 DSA 对账) 的 kind 标注, 供同 kind 事件合并与风险文案。
+    r.setdefault("price_path", False)
+    r.setdefault("path_kind", None)
     return r
 
 
