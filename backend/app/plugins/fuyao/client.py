@@ -69,7 +69,7 @@ class FuyaoClient:
             raise FuyaoError(f"响应不是 JSON: {path}") from e
         code = payload.get("code")
         if code not in (0, "0", None):
-            raise FuyaoError(f"扶摇接口错误 code={code}: {payload.get('message', '')} ({path})")
+            raise FuyaoError(f"扶摇接口错误 code={code}: {payload.get('message', '')} ({path})", code=code)
         return payload.get("data") or {}
 
     # ---- 快照 ----

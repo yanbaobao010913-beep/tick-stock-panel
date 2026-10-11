@@ -257,6 +257,21 @@ class _UnknownCodeClient(_FakeFinClient):
         return [_INCOME_ROW]
 
 
+def test_client_envelope_error_carries_code(monkeypatch):
+    """信封 code 必须落到 FuyaoError.code —— 负面缓存/限频退避全靠它分流。"""
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"code": 1002, "message": "Unknown thscode", "data": None}
+
+    monkeypatch.setattr("httpx.Client.get", lambda self, path, params=None: _Resp())
+    client = fc.FuyaoClient(api_key="k")
+    with pytest.raises(fc.FuyaoError) as ei:
+        client.financial_statements("income", "999999.SZ")
+    assert ei.value.code == 1002
+
+
 def test_unknown_code_negative_cache_skips_later_tables(monkeypatch):
     """1002 标的记入负面缓存: 同一轮后续表同步不再重发注定失败的请求。"""
     fake = _UnknownCodeClient(unknown={"999999.SZ"})
