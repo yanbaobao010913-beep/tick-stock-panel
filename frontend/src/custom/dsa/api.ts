@@ -38,7 +38,7 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
     } catch { /* ignore */ }
     const msg = detail || `${res.status} ${res.statusText}`
     if (res.status !== 401 && !quiet) toast(msg, 'error')
-    throw new Error(msg)
+    throw Object.assign(new Error(msg), { status: res.status })
   }
   return res.json() as Promise<T>
 }
@@ -234,6 +234,9 @@ export const dsaApi = {
 
   analysisTask: (taskId: string) =>
     request<AnalysisTask>(`${PREFIX}/analysis/tasks/${encodeURIComponent(taskId)}`, { quiet: true }),
+
+  analysisTasks: (limit = 20) =>
+    request<{ tasks: AnalysisTask[] }>(`${PREFIX}/analysis/tasks?limit=${limit}`, { quiet: true }),
 
   reports: (opts?: { symbol?: string; limit?: number; offset?: number; date?: string; before?: string }) => {
     const qs = new URLSearchParams()

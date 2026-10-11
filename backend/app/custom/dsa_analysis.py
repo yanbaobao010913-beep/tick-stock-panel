@@ -520,6 +520,16 @@ def _task_public(task: dict) -> dict:
         }
 
 
+def _list_recent_tasks(limit: int) -> list[dict]:
+    """按创建顺序倒序返回最近的任务 (含已结束的任务)。
+
+    只在持锁时取快照, 序列化交给 _task_public 各自加锁, 避免非重入锁嵌套。
+    """
+    with _task_lock:
+        recent = list(_tasks.values())[-limit:]
+    return [_task_public(task) for task in reversed(recent)]
+
+
 def _ensure_worker() -> None:
     global _worker_thread
     with _worker_lock:
@@ -816,6 +826,13 @@ def setup(registrar: BackendExtensionRegistrar) -> None:
         except Exception:
             logger.exception("dsa watch engine capture failed")
         return {"task_id": task["task_id"]}
+
+    @router.get("/analysis/tasks")
+    def list_analysis_tasks(limit: int = 20) -> dict:
+        """任务列表 (内存态): 前端刷新/重挂载后靠它找回还在跑的任务进度。"""
+        if limit < 1:
+            raise HTTPException(status_code=400, detail="limit 须 >= 1")
+        return {"tasks": _list_recent_tasks(min(limit, _MAX_LIMIT))}
 
     @router.get("/analysis/tasks/{task_id}")
     def get_analysis_task(task_id: str) -> dict:

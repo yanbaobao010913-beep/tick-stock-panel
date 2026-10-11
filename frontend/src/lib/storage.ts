@@ -41,6 +41,9 @@ export const storage = {
   /** 查询轮询 / SSE 配置 */
   queryConfig:          kv<unknown>('tf-stocks-query-config'),
 
+  /** DSA 分析进行中任务 id 列表 (刷新/切页后恢复进度条; 终态或 404 时移除) */
+  dsaAnalysisTasks:     kv<string[]>('dsa_analysis_active_tasks'),
+
   /** 策略池 (screener) — 统一池 (日线+分钟共用, 执行按各自声明周期路由) */
   strategyPool:         kv<string[]>('strategy-pool'),
   /** 旧分钟隔离池 — 仅作一次性迁移读取源, 迁移完成后移除该 key */

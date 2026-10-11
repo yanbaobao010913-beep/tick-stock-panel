@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { FlaskConical, ListChecks, Play, RefreshCw, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { storage } from '@/lib/storage'
 import { EmptyState } from '@/components/EmptyState'
 import { Modal } from '@/components/Modal'
 import { toast } from '@/components/Toast'
-import { dsaApi, type ReportSummary, type LegacyReportSummary } from '../api'
+import { dsaApi, type AnalysisTask, type ReportSummary, type LegacyReportSummary } from '../api'
 import { ReportDetailDialog } from './ReportDetailDialog'
 
 const btnCls =
@@ -130,12 +131,15 @@ function NewAnalysisDialog({ onClose, onCreated }: { onClose: () => void; onCrea
 
 // ===== 任务进度卡 =====
 
-function TaskProgressCard({ taskId, onDone }: { taskId: string; onDone: () => void }) {
+function TaskProgressCard({ taskId, onDone, onGone }: { taskId: string; onDone: (task: AnalysisTask) => void; onGone: () => void }) {
   const queryClient = useQueryClient()
-  const { data: task } = useQuery({
+  const { data: task, error } = useQuery({
     queryKey: ['dsa', 'analysis-task', taskId],
     queryFn: () => dsaApi.analysisTask(taskId),
-    refetchInterval: (q) => (q.state.data?.status === 'running' ? 2000 : false),
+    // 404 = 任务已丢失 (如后端重启清内存表), 不重试, 交给 onGone 清理
+    retry: (count, err) => (err as { status?: number }).status === 404 ? false : count < 3,
+    // 终态停止轮询; 尚无数据的瞬时失败继续轮询, 避免首次失败永久停表
+    refetchInterval: (q) => (q.state.data && q.state.data.status !== 'running' ? false : 2000),
   })
 
   // 每完成一只就刷新报告列表，不等整批结束
@@ -144,9 +148,18 @@ function TaskProgressCard({ taskId, onDone }: { taskId: string; onDone: () => vo
     if (doneCount > 0) queryClient.invalidateQueries({ queryKey: ['dsa', 'reports'] })
   }, [doneCount, queryClient])
 
+  // onDone/onGone 由父组件内联传入, 每次渲染换引用, 用 ref 保证只触发一次
+  const notified = useRef(false)
   useEffect(() => {
-    if (task && task.status !== 'running') onDone()
-  }, [task, onDone])
+    if (notified.current) return
+    if (task && task.status !== 'running') {
+      notified.current = true
+      onDone(task)
+    } else if ((error as { status?: number } | null)?.status === 404) {
+      notified.current = true
+      onGone()
+    }
+  }, [task, error, onDone, onGone])
 
   if (!task) return null
   const pct = task.total ? Math.round((task.done / task.total) * 100) : 0
@@ -254,15 +267,45 @@ export function DsaAnalysisSection({ symbol }: { symbol?: string }) {
   const [scope, setScope] = useState<'today' | 'past'>('today')
   const [symbolFilter, setSymbolFilter] = useState('')
   const [showNew, setShowNew] = useState(false)
-  const [activeTaskIds, setActiveTaskIds] = useState<string[]>([])
+  // 任务 id 持久化: 刷新/切页重挂载后恢复进度条 (后端任务独立运行, 与前端连接无关);
+  // 与下方 analysisTasks 列表找回互为兜底 — 旧后端无列表接口时靠 localStorage, 换浏览器/清缓存时靠列表
+  const [activeTaskIds, setActiveTaskIds] = useState<string[]>(() => storage.dsaAnalysisTasks.get([]))
   const [analyzingWatchlist, setAnalyzingWatchlist] = useState(false)
   const [opened, setOpened] = useState<{ kind: 'report' | 'legacy'; id: string } | null>(null)
   const queryClient = useQueryClient()
 
+  useEffect(() => {
+    storage.dsaAnalysisTasks.set(activeTaskIds)
+  }, [activeTaskIds])
+
+  const removeTask = (id: string) => setActiveTaskIds((prev) => prev.filter((t) => t !== id))
+
   const now = new Date()
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
 
-  const health = useQuery({ queryKey: ['dsa', 'health'], queryFn: () => dsaApi.health(), retry: 1 })
+  // health 失败后每 30s 自愈重试, 避免一次抖动永久遮挡任务进度卡
+  const health = useQuery({
+    queryKey: ['dsa', 'health'],
+    queryFn: () => dsaApi.health(),
+    retry: 1,
+    refetchInterval: (q) => (q.state.status === 'error' ? 30_000 : false),
+  })
+
+  // 任务表只活在后端进程内存里, 组件重挂载/刷新页面就找不到 task_id 了: 开块时按列表找回仍在跑的任务
+  useEffect(() => {
+    let alive = true
+    dsaApi
+      .analysisTasks()
+      .then((d) => {
+        if (!alive) return
+        const ids = d.tasks.filter((t) => t.status === 'running').map((t) => t.task_id)
+        if (ids.length) setActiveTaskIds((prev) => Array.from(new Set([...ids, ...prev])))
+      })
+      .catch(() => { /* 未登录或扩展未就绪时没有进度卡可恢复, 由 health 横幅提示 */ })
+    return () => {
+      alive = false
+    }
+  }, [])
 
   const reports = useQuery({
     queryKey: ['dsa', 'reports', symbolFilter, scope, today],
@@ -360,8 +403,19 @@ export function DsaAnalysisSection({ symbol }: { symbol?: string }) {
                 <TaskProgressCard
                   key={id}
                   taskId={id}
-                  onDone={() => {
+                  onDone={(task) => {
+                    removeTask(id)
                     queryClient.invalidateQueries({ queryKey: ['dsa', 'reports'] })
+                    const failed = task.items.filter((it) => it.status === 'failed').length
+                    if (task.status === 'done') {
+                      toast(`分析任务完成（${task.done}/${task.total}）${failed ? `，其中 ${failed} 只失败` : ''}`, 'success')
+                    } else {
+                      toast(`分析任务失败（${task.done}/${task.total}）`, 'error')
+                    }
+                  }}
+                  onGone={() => {
+                    removeTask(id)
+                    toast('分析任务已丢失（后端重启会清空内存任务表），请重新创建', 'error')
                   }}
                 />
               ))}

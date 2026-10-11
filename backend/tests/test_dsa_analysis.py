@@ -4,6 +4,7 @@
 LLM 输出解析(正常 json 块/无围栏/字符串数字/坏 json/取最后一块/不许编造)、
 符号规范化(裸 6 位/前缀式/点分式/维表优先/规则兜底/非法透传)、
 任务 API(创建校验/规范化去重保序/轮询终态/item 级 error 不拖垮/404)、
+任务列表 API(最近任务倒序/limit 校验/进行中任务可见)、
 报告 API(列表分页/裸代码查后缀式报告/详情/删除/404)、schedule GET/PUT 校验与持久化、
 调度判定纯函数与 tick 胶水(触发/当日一次/非交易日/无 Key/空自选)。
 
@@ -13,6 +14,7 @@ LLM 与数据访问全部 mock (StubRepo + monkeypatch generate_ai_text),
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime
 
@@ -504,6 +506,50 @@ def test_task_dedup_preserves_order_and_defaults_full_mode(client, monkeypatch):
     assert all(i["status"] == "done" for i in body["items"])
     detail = client.get(f"{REPORTS_URL}/{body['items'][0]['report_id']}").json()
     assert detail["mode"] == "full"
+
+
+def test_list_tasks_returns_recent_newest_first_including_running(client, monkeypatch):
+    """复现进度条丢失: 前端刷新后 task_id 没了, 只能靠列表接口找回还在跑的任务。"""
+    release = threading.Event()
+
+    async def blocking(messages, **kwargs):
+        assert release.wait(15), "LLM 桩未被释放"
+        return _llm_text()
+
+    monkeypatch.setattr(dsa_analysis, "generate_ai_text", blocking)
+    first = client.post(TASKS_URL, json={"symbols": ["600519"]}).json()["task_id"]
+    # 等工作线程取走 first 并卡在 LLM, 保证它是"进行中"而不是排队中
+    for _ in range(200):
+        if client.get(f"{TASKS_URL}/{first}").json()["items"][0]["status"] == "running":
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("first task never entered running item state")
+
+    second = client.post(TASKS_URL, json={"symbols": ["000001"]}).json()["task_id"]
+    body = client.get(TASKS_URL).json()
+    assert [t["task_id"] for t in body["tasks"]] == [second, first]
+    running = body["tasks"][1]
+    assert running["status"] == "running"
+    assert running["total"] == 1 and running["done"] == 0
+    # 列表与单任务查询同一份视图
+    assert running == client.get(f"{TASKS_URL}/{first}").json()
+
+    release.set()
+    _poll_task(client, first)
+    _poll_task(client, second)
+
+
+def test_list_tasks_limit_and_validation(client, monkeypatch):
+    monkeypatch.setattr(dsa_analysis, "generate_ai_text", _mock_llm(_llm_text()))
+    ids = [client.post(TASKS_URL, json={"symbols": [f"{i:06d}.SZ"]}).json()["task_id"] for i in range(3)]
+    for task_id in ids:
+        _poll_task(client, task_id)
+
+    assert [t["task_id"] for t in client.get(f"{TASKS_URL}?limit=2").json()["tasks"]] == [ids[2], ids[1]]
+    # _MAX_LIMIT 上限截断, 不放大内存快照
+    assert len(client.get(f"{TASKS_URL}?limit=1000").json()["tasks"]) == 3
+    assert client.get(f"{TASKS_URL}?limit=0").status_code == 400
 
 
 def test_task_lifecycle_runs_items_saves_reports(client, monkeypatch):
