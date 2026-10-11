@@ -27,10 +27,12 @@
 from __future__ import annotations
 
 import calendar
+import concurrent.futures
 import contextlib
 import logging
 import math
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -56,8 +58,21 @@ SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级�
 # 扶摇 *ms 时间字段为北京时间零点(= UTC 前一日 16:00), +8h 后按 UTC 解析即得交易日
 _SH_MS = 28_800_000
 _HIST_MAX_SPAN_MS = 3650 * 86_400_000  # historical 单次窗口上限 10 年, 超出由本层分片
-_HIST_INTERVAL_S = 0.12  # 单标的请求节流(实测 200+ 连发未触发 4001 限频)
+_HIST_INTERVAL_S = 0.12  # 单标的请求节流(实测 200+ 连发未触发 4001 限频), 兼作 AIMD 起点速率
 _FINANCIAL_HISTORY_PERIODS = 8  # 财务首装全量历史: 最近 8 期季报(约 2 年)
+
+# ---- 财务拉取 AIMD 并发控制(限频阈值未知下的自适应探测) ----
+# 从实测安全速率起步, 连续成功达标提速, 撞限频(code=4001)减半 + 全局冷却。
+# 全市场财务端点均为单标的(client 实测 thscode 不接受逗号), 请求数无法再降,
+# 唯一可压的是速率。
+_FIN_MAX_WORKERS = 8  # 20 req/s × ~80ms RTT 已足够喂饱, 无需更多
+_AIMD_ACCEL_WINDOW = 200  # 连续成功 N 次 → 提速一档
+_AIMD_ACCEL_FACTOR = 1.25
+_AIMD_BACKOFF_FACTOR = 0.5
+_AIMD_COOLDOWN_S = 20.0
+_AIMD_RATE_CAP = 25.0  # 无证据支持更激进, 不做极限压榨
+_NEG_UNKNOWN_TTL_S = 7 * 86400  # code=1002 未知代码负面缓存(退市/特殊状态股)
+_INCOME_PROBE_TTL_S = 2 * 3600  # metrics 复用 income 反查的时效(需覆盖一整轮全量)
 _VALUATION_BATCH = 100  # 估值/价格快照端点单次上限 100 只
 # 项目财务表名 → 扶摇报表端点名
 _STATEMENT_ENDPOINTS = {
@@ -300,6 +315,165 @@ def _map_snapshot_row(row: dict, fetched_ms: int, *, volume_to_hand: bool = True
         "timestamp": fetched_ms,
         "session": None,
     }
+
+
+class _AdaptivePacer:
+    """全局请求节奏器(线程安全): 所有财务 worker 在 acquire() 处按当前速率排队发牌。
+
+    AIMD: 连续成功达标提速一档; 撞限频立即减半并冻结发牌冷却 — 冷却由
+    _next_slot 前移实现, 后续 acquire 自动等待, 无需各 worker 自行 sleep。
+    速率下限钉在起点值(实测安全速率), 没有理由退到已证明安全的速率之下。
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._rate = rate
+        self._min_rate = rate
+        self._lock = threading.Lock()
+        self._next_slot = 0.0
+        self._streak = 0
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            slot = max(self._next_slot, now)
+            self._next_slot = slot + 1.0 / self._rate
+        if slot > now:
+            time.sleep(slot - now)
+
+    def on_success(self) -> None:
+        with self._lock:
+            self._streak += 1
+            if self._streak >= _AIMD_ACCEL_WINDOW and self._rate < _AIMD_RATE_CAP:
+                self._rate = min(self._rate * _AIMD_ACCEL_FACTOR, _AIMD_RATE_CAP)
+                self._streak = 0
+                logger.info("扶摇财务节奏器提速: %.1f req/s", self._rate)
+
+    def on_throttled(self) -> None:
+        with self._lock:
+            self._rate = max(self._rate * _AIMD_BACKOFF_FACTOR, self._min_rate)
+            self._streak = 0
+            self._next_slot = max(self._next_slot, time.monotonic() + _AIMD_COOLDOWN_S)
+            logger.warning("扶摇财务触发限频(4001): 速率降到 %.1f req/s, 冷却 %ds", self._rate, int(_AIMD_COOLDOWN_S))
+
+
+# 进程级财务同步状态: 节奏器跨表复用(速率学习不因换表丢失); 负面缓存与 income
+# 反查缓存跨 get_financials 调用存活(一轮全量 = 5 次调用)。锁内只做 dict 读写。
+_FIN_PACER: _AdaptivePacer | None = None
+_UNKNOWN_CODES: dict[str, float] = {}  # symbol → 负面缓存过期时刻(monotonic)
+_INCOME_PROBE: dict[str, tuple[float, dict]] = {}  # symbol → (缓存时刻, income limit=1 原始行)
+_FIN_STATE_LOCK = threading.Lock()
+
+
+def _reset_financial_state() -> None:
+    """清空进程级财务同步状态(测试隔离用)。"""
+    global _FIN_PACER
+    with _FIN_STATE_LOCK:
+        _UNKNOWN_CODES.clear()
+        _INCOME_PROBE.clear()
+        _FIN_PACER = None
+
+
+def _fin_pacer() -> _AdaptivePacer:
+    global _FIN_PACER
+    with _FIN_STATE_LOCK:
+        if _FIN_PACER is None:
+            # 起点取实测安全速率(0.12s 节流 ≈ 8.3 req/s); 节流置 0(测试)时直接用上限
+            rate = 1.0 / _HIST_INTERVAL_S if _HIST_INTERVAL_S > 0 else _AIMD_RATE_CAP
+            _FIN_PACER = _AdaptivePacer(min(rate, _AIMD_RATE_CAP))
+        return _FIN_PACER
+
+
+def _unknown_code_skip(symbol: str) -> bool:
+    with _FIN_STATE_LOCK:
+        expiry = _UNKNOWN_CODES.get(symbol)
+        if expiry is None:
+            return False
+        if expiry < time.monotonic():
+            del _UNKNOWN_CODES[symbol]
+            return False
+        return True
+
+
+def _mark_unknown_code(symbol: str) -> None:
+    with _FIN_STATE_LOCK:
+        _UNKNOWN_CODES[symbol] = time.monotonic() + _NEG_UNKNOWN_TTL_S
+
+
+def _income_probe_cached(symbol: str) -> dict | None:
+    with _FIN_STATE_LOCK:
+        entry = _INCOME_PROBE.get(symbol)
+    if entry is None:
+        return None
+    ts, row = entry
+    if time.monotonic() - ts > _INCOME_PROBE_TTL_S:
+        return None
+    return row
+
+
+def _income_probe_store(symbol: str, row: dict) -> None:
+    with _FIN_STATE_LOCK:
+        _INCOME_PROBE[symbol] = (time.monotonic(), dict(row))
+
+
+def _err_code(e: FuyaoError) -> int | None:
+    try:
+        return int(getattr(e, "code", None))
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_financial_requests(
+    symbols: list[str],
+    fn: Callable[[str], object],
+    label: str,
+) -> Iterator[tuple[str, object]]:
+    """AIMD 并发执行 fn(sym), yield (symbol, 结果)。
+
+    - 负面缓存(1002 未知代码)内的标的直接跳过, 全市场多表轮同步不再重复撞墙;
+    - 限频(4001): 减速 + 全局冷却后原地重试一次, 再失败才弃该标的;
+    - 其余 FuyaoError(网络/无数据/服务端错误)记 warning 跳过, 语义与原串行版一致;
+    - 非 FuyaoError 异常向上抛(与原串行版一致, 由 financial_sync 兜底整表)。
+    非 None 结果才 yield, 失败标的由调用方按缺数处理。
+    """
+    pacer = _fin_pacer()
+    pending = [s for s in symbols if not _unknown_code_skip(s)]
+    skipped = len(symbols) - len(pending)
+    if skipped:
+        logger.info("扶摇财务: 负面缓存跳过 %d 个未知代码标的", skipped)
+
+    def _task(sym: str) -> tuple[str, object | None]:
+        for attempt in range(2):
+            try:
+                pacer.acquire()
+                result = fn(sym)
+            except FuyaoError as e:
+                code = _err_code(e)
+                if code == 4001:
+                    pacer.on_throttled()
+                    if attempt == 0:
+                        continue  # 冷却由 acquire 兜住, 原地重试一次
+                    logger.warning("扶摇财务 %s %s 重试后仍限频: %s", label, sym, e)
+                    return sym, None
+                if code == 1002:
+                    _mark_unknown_code(sym)
+                    pacer.on_success()
+                    return sym, None
+                logger.warning("扶摇财务 %s %s 失败: %s", label, sym, e)
+                pacer.on_success()  # 服务端正常应答(非限频), 计入提速连击
+                return sym, None
+            pacer.on_success()
+            return sym, result
+        return sym, None  # pragma: no cover — 重试循环恰好耗尽的防御
+
+    workers = min(_FIN_MAX_WORKERS, max(1, len(pending)))
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="fuyao-fin"
+    ) as pool:
+        futs = [pool.submit(_task, s) for s in pending]
+        for fut in futs:
+            sym, result = fut.result()
+            if result is not None:
+                yield sym, result
 
 
 class FuyaoProvider:
@@ -942,14 +1116,11 @@ class FuyaoProvider:
         client = self._get_client()
         limit = 1 if latest_only else _FINANCIAL_HISTORY_PERIODS
         rows_out: list[dict] = []
-        for i, sym in enumerate(symbols):
-            if i:
-                time.sleep(_HIST_INTERVAL_S)
-            try:
-                rows = client.financial_statements(stmt, sym, limit=limit)
-            except FuyaoError as e:
-                logger.warning("扶摇财务 %s %s 失败: %s", stmt, sym, e)
-                continue
+
+        def _fetch(sym: str) -> list[dict]:
+            return client.financial_statements(stmt, sym, limit=limit)
+
+        for sym, rows in _run_financial_requests(symbols, _fetch, label=stmt):
             for r in rows:
                 row: dict = {
                     "symbol": sym,
@@ -963,6 +1134,9 @@ class FuyaoProvider:
                     if src not in field_map and src not in row and isinstance(value, (int, float)):
                         row[src] = value
                 rows_out.append(row)
+            # metrics 反查复用: 记住 latest 档利润表原始行, 同一轮 metrics 不再重发
+            if stmt == "income" and limit == 1 and rows:
+                _income_probe_store(sym, rows[0])
         # 稀疏列(如仅银行有值的 financial_expense)前 100 行可能全空, 默认采样会
         # 推断成 Null 列, 后续数值 append 失败 → 全量扫描推断
         return pl.DataFrame(rows_out, infer_schema_length=None) if rows_out else pl.DataFrame()
@@ -970,21 +1144,22 @@ class FuyaoProvider:
     def _financial_metrics(self, symbols: list[str]) -> pl.DataFrame:
         client = self._get_client()
         # 指标接口按 report(yyyy-N) 单期查询 → 先用利润表 limit=1 反查每股最新披露期
+        # (同一轮 income 表同步缓存的原始行直接复用, 每股省一次请求)
         latest: dict[str, dict] = {}
-        for i, sym in enumerate(symbols):
-            if i:
-                time.sleep(_HIST_INTERVAL_S)
-            try:
-                rows = client.financial_statements("income", sym, limit=1)
-            except FuyaoError as e:
-                logger.warning("扶摇财务 income %s 失败: %s", sym, e)
-                continue
+
+        def _probe(sym: str) -> list[dict]:
+            cached = _income_probe_cached(sym)
+            if cached is not None:
+                return [cached]
+            return client.financial_statements("income", sym, limit=1)
+
+        for sym, rows in _run_financial_requests(symbols, _probe, label="metrics/income"):
             if rows:
                 latest[sym] = rows[0]
         if not latest:
             return pl.DataFrame()
         bps_by_sym = self._derive_bps(sorted(latest))
-        rows_out: list[dict] = []
+        base: dict[str, tuple[dict, str | None]] = {}
         for sym, r in latest.items():
             quarter = _report_quarter(r.get("fiscal_period"))
             report = f"{r.get('fiscal_year')}-{quarter}" if quarter else None
@@ -995,21 +1170,26 @@ class FuyaoProvider:
                 "eps_basic": _to_float(r.get("basic_eps")),
                 "bps": bps_by_sym.get(sym),
             }
-            if report:
-                try:
-                    abilities = client.financial_indicators(sym, report)
-                except FuyaoError as e:
-                    logger.warning("扶摇指标 %s %s 失败: %s", sym, report, e)
-                    abilities = []
-                for ability in abilities:
-                    for ind in ability.get("indicators") or []:
-                        index_id = ind.get("index_id")
-                        if not index_id:
-                            continue
-                        value = _to_float(ind.get("value"))
-                        if value is not None:
-                            row[self._METRICS_FIELD_MAP.get(index_id, index_id)] = value
-            rows_out.append(row)
+            base[sym] = (row, report)
+
+        def _indicators(sym: str) -> list[dict]:
+            report = base[sym][1]
+            if not report:
+                return []
+            return client.financial_indicators(sym, report)
+
+        # 指标单股失败(code=5003 未披露期等)不弃行: base 行已带 eps/bps
+        for sym, abilities in _run_financial_requests(list(base), _indicators, label="metrics/indicators"):
+            row = base[sym][0]
+            for ability in abilities:
+                for ind in ability.get("indicators") or []:
+                    index_id = ind.get("index_id")
+                    if not index_id:
+                        continue
+                    value = _to_float(ind.get("value"))
+                    if value is not None:
+                        row[self._METRICS_FIELD_MAP.get(index_id, index_id)] = value
+        rows_out = [base[sym][0] for sym in latest]
         return pl.DataFrame(rows_out) if rows_out else pl.DataFrame()
 
     def trading_days(self) -> set:

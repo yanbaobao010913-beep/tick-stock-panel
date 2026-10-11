@@ -25,6 +25,11 @@ _BATCH_SIZE = 100
 # 财务报表 + 历史股本表
 FINANCIAL_TABLES = ("metrics", "income", "balance_sheet", "cash_flow", "shares")
 
+# 全量同步的执行顺序: income 必须先于 metrics —— fuyao 的 metrics 需先用利润表
+# limit=1 反查每股最新披露期, income 先同步时 provider 会缓存该结果直接复用,
+# 全市场每股省一次请求。其余消费方(恢复/兜底遍历)仍用 FINANCIAL_TABLES, 顺序无关。
+_SYNC_ORDER = ("income", "balance_sheet", "cash_flow", "metrics", "shares")
+
 
 # ================================================================
 # 同步函数
@@ -260,7 +265,7 @@ def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
 
     symbols = _get_symbols(data_dir)
     results: dict[str, int] = {}
-    for table in FINANCIAL_TABLES:
+    for table in _SYNC_ORDER:
         results[table] = _sync_history_table_for_symbols(
             table, symbols, data_dir, capset
         )
@@ -455,7 +460,7 @@ class FinancialScheduler:
         # 全部同步
         symbols = _get_symbols(self._data_dir)
         result: dict[str, int] = {}
-        for t in FINANCIAL_TABLES:
+        for t in _SYNC_ORDER:
             result[t] = _sync_history_table_for_symbols(
                 t, symbols, self._data_dir, self._capset
             )

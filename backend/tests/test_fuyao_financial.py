@@ -54,11 +54,14 @@ class _FakeFinClient:
 
 
 def _provider_with(monkeypatch, fake):
+    fp._reset_financial_state()
     monkeypatch.setattr(
         fp, "fuyao_client", type("M", (), {"FuyaoClient": lambda **kw: fake})
     )
     monkeypatch.setattr(fp, "get_api_key", lambda: "test-key")
     monkeypatch.setattr(fp, "_HIST_INTERVAL_S", 0)
+    # 测试不限速: 节奏器直接用上限速率, 避免 AIMD 发牌在断言里引入真实 sleep
+    monkeypatch.setattr(fp, "_AIMD_RATE_CAP", 1e9)
     return FuyaoProvider()
 
 
@@ -238,6 +241,82 @@ def test_metrics_skips_symbol_without_income(monkeypatch):
 def test_shares_returns_empty(monkeypatch):
     provider = _provider_with(monkeypatch, _FakeFinClient())
     assert provider.get_financials("shares", ["600519.SH"]).is_empty()
+
+
+class _UnknownCodeClient(_FakeFinClient):
+    """指定标的返回 code=1002 (退市/特殊状态, 服务端不认识)。"""
+
+    def __init__(self, unknown: set[str]):
+        super().__init__()
+        self.unknown = unknown
+
+    def financial_statements(self, stmt, thscode, limit=1):
+        self.stmt_calls.append((stmt, thscode, limit))
+        if thscode in self.unknown:
+            raise fc.FuyaoError(f"code=1002: Unknown thscode: {thscode}", code=1002)
+        return [_INCOME_ROW]
+
+
+def test_unknown_code_negative_cache_skips_later_tables(monkeypatch):
+    """1002 标的记入负面缓存: 同一轮后续表同步不再重发注定失败的请求。"""
+    fake = _UnknownCodeClient(unknown={"999999.SZ"})
+    provider = _provider_with(monkeypatch, fake)
+    df = provider.get_financials("income", ["600519.SH", "999999.SZ"], latest_only=True)
+    assert df.height == 1  # 失败标的缺数, 正常标的照写
+    assert fp._unknown_code_skip("999999.SZ")
+    calls_after_income = len(fake.stmt_calls)
+    provider.get_financials("balance_sheet", ["600519.SH", "999999.SZ"])
+    new_calls = fake.stmt_calls[calls_after_income:]
+    assert all(sym != "999999.SZ" for _, sym, _ in new_calls)  # 只剩正常标的的请求
+
+
+def test_metrics_reuses_income_probe(monkeypatch):
+    """同一轮 income 表同步后, metrics 反查直接复用缓存, 不重发 income 请求。"""
+    fake = _FakeFinClient(
+        statements={"income": [_INCOME_ROW]},
+        indicators={"2026-2": _METRICS_ABILITIES},
+        valuations=[{"thscode": "600519.SH", "pb_mrq": 6.455055}],
+        prices=[{"thscode": "600519.SH", "last_price": 1297.4}],
+    )
+    provider = _provider_with(monkeypatch, fake)
+    provider.get_financials("income", ["600519.SH"], latest_only=True)
+    calls_after_income = len(fake.stmt_calls)
+    df = provider.get_financials("metrics", ["600519.SH"])
+    assert df.to_dicts()[0]["roe"] == pytest.approx(16.75)  # 复用缓存组装结果不变
+    assert len(fake.stmt_calls) == calls_after_income  # income 零重发
+    assert fake.ind_calls == ["600519.SH@2026-2"]  # 指标请求照发
+
+
+def test_adaptive_pacer_aimd_bounds():
+    """AIMD 数学: 连续成功提速 25%、撞限频减半、下限钉在起点、上限封顶。"""
+    pacer = fp._AdaptivePacer(10.0)
+    for _ in range(fp._AIMD_ACCEL_WINDOW):
+        pacer.on_success()
+    assert pacer._rate == pytest.approx(12.5)
+    pacer.on_throttled()
+    assert pacer._rate == pytest.approx(10.0)  # 12.5×0.5=6.25 → 不低于实测安全起点
+    capped = fp._AdaptivePacer(24.0)
+    for _ in range(fp._AIMD_ACCEL_WINDOW):
+        capped.on_success()
+    assert capped._rate == pytest.approx(fp._AIMD_RATE_CAP)  # 30 → 封顶 25
+
+
+def test_concurrent_requests_preserve_row_semantics(monkeypatch):
+    """并发改造后逐股语义不变: 部分失败跳过、成功行齐全、列口径不漂移。"""
+    class _FlakyClient(_FakeFinClient):
+        def financial_statements(self, stmt, thscode, limit=1):
+            self.stmt_calls.append((stmt, thscode, limit))
+            if thscode.endswith("0002.SH"):
+                raise fc.FuyaoError("网络请求失败: boom")  # 非 1002/4001 → 跳过
+            return [dict(_INCOME_ROW, thscode=thscode)]
+
+    syms = [f"60000{i}.SH" for i in range(1, 6)]
+    fake = _FlakyClient()
+    provider = _provider_with(monkeypatch, fake)
+    df = provider.get_financials("income", syms, latest_only=True)
+    assert df.height == 4  # 失败 1 只, 其余齐全
+    assert df["symbol"].to_list() == [s for s in syms if s != "600002.SH"]
+    assert df.schema["basic_eps"] == pl.Float64
 
 
 def test_merge_fills_missing_cells_from_old_rows():
