@@ -310,10 +310,10 @@ def test_adaptive_pacer_aimd_bounds():
     assert pacer._rate == pytest.approx(12.5)
     pacer.on_throttled()
     assert pacer._rate == pytest.approx(10.0)  # 12.5×0.5=6.25 → 不低于实测安全起点
-    capped = fp._AdaptivePacer(24.0)
+    capped = fp._AdaptivePacer(fp._AIMD_RATE_CAP * 0.9)
     for _ in range(fp._AIMD_ACCEL_WINDOW):
         capped.on_success()
-    assert capped._rate == pytest.approx(fp._AIMD_RATE_CAP)  # 30 → 封顶 25
+    assert capped._rate == pytest.approx(fp._AIMD_RATE_CAP)  # 0.9×1.25=1.125 → 封顶
 
 
 def test_concurrent_requests_preserve_row_semantics(monkeypatch):
