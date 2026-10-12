@@ -70,7 +70,7 @@ _AIMD_ACCEL_WINDOW = 200  # 连续成功 N 次 → 提速一档
 _AIMD_ACCEL_FACTOR = 1.25
 _AIMD_BACKOFF_FACTOR = 0.5
 _AIMD_COOLDOWN_S = 20.0
-_AIMD_RATE_CAP = 25.0  # 无证据支持更激进, 不做极限压榨
+_AIMD_RATE_CAP = 40.0  # 25 req/s 两轮全量零限频(2026-10-12 实测), 上探看真实天花板; 撞 4001 自动减半回落
 _NEG_UNKNOWN_TTL_S = 7 * 86400  # code=1002 未知代码负面缓存(退市/特殊状态股)
 _INCOME_PROBE_TTL_S = 2 * 3600  # metrics 复用 income 反查的时效(需覆盖一整轮全量)
 _VALUATION_BATCH = 100  # 估值/价格快照端点单次上限 100 只
